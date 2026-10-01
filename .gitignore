@@ -1,0 +1,25 @@
+# dependencies / build
+node_modules/
+dist/
+*.tsbuildinfo
+
+# secrets: .env is NEVER committed. .env.example is the committed template.
+.env
+.env.*
+!.env.example
+
+# Google service account JSON key (must never be committed)
+*service-account*.json
+*-sa-key.json
+
+# logs / coverage / OS
+*.log
+logs/
+coverage/
+
+# editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
