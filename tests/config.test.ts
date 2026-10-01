@@ -316,6 +316,60 @@ describe('.env file: quoted values and escaped newlines', () => {
   });
 });
 
+describe('Supabase key roles', () => {
+  const serviceKey = (role: string): string =>
+    `${Buffer.from(JSON.stringify({ alg: 'HS256' })).toString('base64url')}.${Buffer.from(
+      JSON.stringify({ role, iss: 'supabase' }),
+    ).toString('base64url')}.signature`;
+
+  it('accepts the documented new-style secret and publishable keys', () => {
+    const config = loadEnv(baseEnv({ SUPABASE_SERVICE_ROLE_KEY: 'sb_secret_abc123' }));
+    expect(config.supabase.serviceRoleKey).toBe('sb_secret_abc123');
+  });
+
+  it('accepts a legacy service_role JWT', () => {
+    expect(loadEnv(baseEnv({ SUPABASE_SERVICE_ROLE_KEY: serviceKey('service_role') })).supabase.serviceRoleKey).toBeTruthy();
+  });
+
+  it('rejects a publishable key in the service-role slot', () => {
+    expect(() => loadEnv(baseEnv({ SUPABASE_SERVICE_ROLE_KEY: 'sb_publishable_abc123' }))).toThrow(
+      /publishable\/anon key/,
+    );
+    expect(() => loadEnv(baseEnv({ SUPABASE_SERVICE_ROLE_KEY: serviceKey('anon') }))).toThrow(/publishable\/anon key/);
+  });
+
+  it('rejects a secret key in the anon slot, because that key bypasses RLS', () => {
+    expect(() =>
+      loadEnv(baseEnv({ SUPABASE_ANON_KEY: 'sb_secret_abc123' })),
+    ).toThrow(/bypasses RLS/);
+    expect(() => loadEnv(baseEnv({ SUPABASE_ANON_KEY: serviceKey('service_role') }))).toThrow(/bypasses RLS/);
+  });
+
+  it('accepts a publishable key in the anon slot', () => {
+    const config = loadEnv(baseEnv({ SUPABASE_ANON_KEY: 'sb_publishable_abc123' }));
+    expect(config.supabase.anonKey).toBe('sb_publishable_abc123');
+  });
+
+  it('does not complain about a key format it does not recognise', () => {
+    // Failing on an unknown format would break a future key type this code has
+    // never heard of; only the known-bad combinations are rejected.
+    expect(loadEnv(baseEnv({ SUPABASE_SERVICE_ROLE_KEY: 'something-new' })).supabase.serviceRoleKey).toBe(
+      'something-new',
+    );
+  });
+
+  it('never puts key material in the error message', () => {
+    let message = '';
+    try {
+      loadEnv(baseEnv({ SUPABASE_SERVICE_ROLE_KEY: 'sb_publishable_super_secret_value' }));
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain('SUPABASE_SERVICE_ROLE_KEY');
+    expect(message).not.toContain('super_secret_value');
+  });
+});
+
 describe('.env parsing', () => {
   it('handles comments, blank lines, inline comments and quotes', () => {
     const parsed = parseDotEnv(

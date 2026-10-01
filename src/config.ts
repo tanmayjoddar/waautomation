@@ -210,6 +210,35 @@ function normalizeEnv(source: RawEnv): RawEnv {
 /** Google service account keys arrive with literal "\n" in .env. */
 const unescapeNewlines = (v: string): string => v.replace(/\\n/g, '\n');
 
+/**
+ * Which Postgres role a Supabase key actually acts as, decided locally from the
+ * key's own format. No signature check is needed or wanted: this only catches
+ * the copy/paste mistake of the two keys landing in each other's variable, and it
+ * never leaves this process.
+ *
+ * Worth the ~15 lines: a publishable key in the service-role slot does not fail
+ * loudly, it fails as "new row violates row-level security policy" from whichever
+ * INSERT runs first, which is a very slow way to learn about it.
+ */
+type SupabaseKeyRole = 'service_role' | 'anon' | 'unknown';
+
+export function supabaseKeyRole(key: string | undefined): SupabaseKeyRole {
+  if (!present(key)) return 'unknown';
+  const value = key as string;
+  if (value.startsWith('sb_secret_')) return 'service_role';
+  if (value.startsWith('sb_publishable_')) return 'anon';
+  if (!value.startsWith('eyJ')) return 'unknown';
+  try {
+    const payload = JSON.parse(Buffer.from(value.split('.')[1] ?? '', 'base64url').toString('utf8')) as {
+      role?: unknown;
+    };
+    if (payload.role === 'service_role' || payload.role === 'anon') return payload.role;
+  } catch {
+    // A key we cannot read is somebody else's problem to detect, not ours.
+  }
+  return 'unknown';
+}
+
 function decodeEncryptionKey(raw: string | undefined, problems: string[]): Buffer | null {
   if (!present(raw)) return null;
   const trimmed = (raw as string).trim();
@@ -270,6 +299,20 @@ export function loadEnv(source: RawEnv = process.env): AppConfig {
   if (present(rawPrivateKey) && !(rawPrivateKey as string).trimStart().startsWith('-----BEGIN')) {
     problems.push(
       'GOOGLE_PRIVATE_KEY: does not look like a private key. Put it on ONE line with \\n escapes, e.g. "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"',
+    );
+  }
+
+  // The two Supabase keys must not be swapped: each one decides whether RLS
+  // applies, and the failure mode of a swap is a confusing database error (or a
+  // browser holding a key that bypasses RLS).
+  if (supabaseKeyRole(env.SUPABASE_SERVICE_ROLE_KEY) === 'anon') {
+    problems.push(
+      'SUPABASE_SERVICE_ROLE_KEY: holds the publishable/anon key, which cannot bypass RLS and will fail every write. Use the secret (service_role) key from Project Settings -> API Keys.',
+    );
+  }
+  if (supabaseKeyRole(env.SUPABASE_ANON_KEY) === 'service_role') {
+    problems.push(
+      'SUPABASE_ANON_KEY: holds the secret/service_role key, which bypasses RLS. A key used by a browser or dashboard must be the publishable (anon) one.',
     );
   }
 
