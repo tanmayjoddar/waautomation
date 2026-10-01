@@ -108,7 +108,7 @@ phone numbers are redacted (`919812345678` -> `91********78`).
 | Slice | Build | State |
 |-------|-------|-------|
 | **0** | Scaffold, `config.ts`, `.env.example`, logging, vitest, `.gitignore` | **done** |
-| **1** | Migration SQL, Supabase client, seed script, RLS test | **code done, awaiting the migration being run in Supabase** |
+| **1** | Migration SQL, Supabase client, seed script, RLS and function tests | **done** (88 tests green against a real project) |
 | 2 | Webhook GET/POST, signature verification, dedupe, `simulate-webhook.ts` | not started |
 | 3 | WhatsApp client adapter (`sendText`, `markReadAndType`) | not started |
 | 4 | Worker + debounce + LLM adapter + prompt + zod schema | not started |
