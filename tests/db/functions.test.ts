@@ -232,7 +232,7 @@ describe.skipIf(!ready.ok)(suiteName, () => {
       const clientId = await newClient(harness, 'requeue');
       const contact = await newContact(harness, clientId, 1);
 
-      await enqueueReplyJob(harness.supabase, clientId, contact, 1);
+      await enqueueReplyJob(harness.supabase, clientId, contact, -5); // already due
       const claimed = await claimDueJob(harness.supabase, clientId);
       expect(claimed?.id, 'the due job must be claimable').toBeTruthy();
 
