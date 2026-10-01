@@ -64,7 +64,8 @@ production database unnoticed.
 
 1. Supabase dashboard -> **SQL Editor** -> **New query**.
 2. Paste the whole of `supabase/migrations/001_init.sql` and run it. It is
-   idempotent, so re-running it is safe.
+   idempotent, so re-running it is safe (and you should re-run it whenever the
+   file changes).
 3. Back in this folder:
 
 ```bash
@@ -136,9 +137,10 @@ phone numbers are redacted (`919812345678` -> `91********78`).
   a two-user test that proves one tenant cannot read or write another's rows.
 - `client_stats` and `claim_due_job` are the two functions a worker must call
   instead of a plain `select`, so a missing tenant scope cannot become a silent
-  data leak. `claim_due_job` claims from the shared queue with `FOR UPDATE SKIP
-  LOCKED`, which is why the job tables are the documented exception to per-tenant
-  querying: every statement after the claim filters by `client_id`.
+  data leak. `claim_due_job(client_id)` claims only that tenant's work; called
+  with no argument it claims from the shared queue with `FOR UPDATE SKIP LOCKED`,
+  which is what the Slice 4 poller needs since it has no tenant of its own.
+  Every other statement filters by `client_id`.
 
 ## Dependencies (and why)
 

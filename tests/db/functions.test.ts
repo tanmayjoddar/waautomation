@@ -16,7 +16,9 @@ import {
   dbTest,
   deleteTestClient,
   schemaReadiness,
+  purgeAbandonedTestTenants,
   testPhone,
+  TEST_CLIENT_PREFIX,
   type DbHarness,
 } from './harness.js';
 
@@ -42,7 +44,7 @@ describe.skipIf(!ready.ok)(suiteName, () => {
     const { data, error } = await harness.supabase
       .from('clients')
       .insert({
-        business_name: `Fns Test ${label} ${harness.tag}`,
+        business_name: `${TEST_CLIENT_PREFIX}fns-${label}-${harness.tag}`,
         phone_number_id: `${harness.tag}-${label}`,
       })
       .select('*')
@@ -83,6 +85,12 @@ describe.skipIf(!ready.ok)(suiteName, () => {
     if (!ready.ok) return;
     h = ready.harness;
     skipReason = await schemaReadiness(h.supabase);
+    if (skipReason !== null) return;
+    // A run that died mid-suite leaves due jobs behind, which would make
+    // "returns null when nothing is due" fail for reasons that have nothing to
+    // do with this run. Cascading a client delete takes its jobs with it.
+    const purged = await purgeAbandonedTestTenants(h.supabase, `${TEST_CLIENT_PREFIX}fns-`);
+    if (purged > 0) console.log(`purged ${purged} test tenant(s) left by an earlier run`);
   });
 
   afterAll(async () => {
@@ -225,7 +233,7 @@ describe.skipIf(!ready.ok)(suiteName, () => {
       const contact = await newContact(harness, clientId, 1);
 
       await enqueueReplyJob(harness.supabase, clientId, contact, 1);
-      const claimed = await claimDueJob(harness.supabase);
+      const claimed = await claimDueJob(harness.supabase, clientId);
       expect(claimed?.id, 'the due job must be claimable').toBeTruthy();
 
       await enqueueReplyJob(harness.supabase, clientId, contact, 60);
@@ -251,7 +259,7 @@ describe.skipIf(!ready.ok)(suiteName, () => {
       const clientId = await newClient(harness, 'nodue');
       const contact = await newContact(harness, clientId, 1);
       await enqueueReplyJob(harness.supabase, clientId, contact, 3600); // due in 1 hour
-      expect(await claimDueJob(harness.supabase), 'a future job must not be claimed').toBeNull();
+      expect(await claimDueJob(harness.supabase, clientId), 'a future job must not be claimed').toBeNull();
     }),
   );
 
@@ -262,7 +270,7 @@ describe.skipIf(!ready.ok)(suiteName, () => {
       const contact = await newContact(harness, clientId, 1);
       await enqueueReplyJob(harness.supabase, clientId, contact, -5); // already due
 
-      const claimed = await claimDueJob(harness.supabase);
+      const claimed = await claimDueJob(harness.supabase, clientId);
       expect(claimed, 'a due job must be claimed').not.toBeNull();
       expect(claimed?.client_id).toBe(clientId);
       expect(claimed?.contact_id).toBe(contact);
@@ -278,7 +286,7 @@ describe.skipIf(!ready.ok)(suiteName, () => {
         attempts: 1,
       });
 
-      expect(await claimDueJob(harness.supabase), 'no second claim of the same job').toBeNull();
+      expect(await claimDueJob(harness.supabase, clientId), 'no second claim of the same job').toBeNull();
     }),
   );
 
@@ -289,7 +297,7 @@ describe.skipIf(!ready.ok)(suiteName, () => {
       const contact = await newContact(harness, clientId, 1);
       await enqueueReplyJob(harness.supabase, clientId, contact, -5);
 
-      const results = await Promise.all([claimDueJob(harness.supabase), claimDueJob(harness.supabase)]);
+      const results = await Promise.all([claimDueJob(harness.supabase, clientId), claimDueJob(harness.supabase, clientId)]);
       const winners = results.filter((job) => job !== null);
       expect(winners, 'exactly one of two concurrent claims may win').toHaveLength(1);
       expect(winners[0]?.attempts, 'the job must be attempted exactly once').toBe(1);
@@ -316,7 +324,7 @@ describe.skipIf(!ready.ok)(suiteName, () => {
         await enqueueReplyJob(harness.supabase, clientId, contact, -5);
       }
 
-      const claims = await Promise.all(Array.from({ length: n }, () => claimDueJob(harness.supabase)));
+      const claims = await Promise.all(Array.from({ length: n }, () => claimDueJob(harness.supabase, clientId)));
       const ids = claims.filter((job) => job !== null).map((job) => job?.id as string);
       expect(ids, 'every job claimed').toHaveLength(n);
       expect(new Set(ids).size, 'no job handed to two workers').toBe(n);

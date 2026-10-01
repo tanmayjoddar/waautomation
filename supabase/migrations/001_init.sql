@@ -256,7 +256,19 @@ $$;
 -- Contract: returns the claimed job with status 'running' and attempts+1, or a
 -- row whose id is NULL when there is nothing due. Callers must check `id`,
 -- never assume a non-null response means "there was a job".
-create or replace function claim_due_job()
+--
+-- p_client_id: pass the tenant you are working for and only that tenant's jobs
+-- are considered, so a caller that already knows its client can never take
+-- another client's work. NULL keeps the shared-queue behaviour for the Slice 4
+-- poller, which has no client context of its own.
+--
+-- Both signatures are dropped first: CREATE OR REPLACE cannot change a
+-- function's parameters, so replacing the old zero-argument version would leave
+-- two overloads and PostgREST would then be unable to choose between them.
+drop function if exists claim_due_job();
+drop function if exists claim_due_job(uuid);
+
+create or replace function claim_due_job(p_client_id uuid default null)
 returns jobs language plpgsql
 set search_path = public, pg_temp
 as $$
@@ -265,6 +277,7 @@ declare
 begin
   select * into j from jobs
    where status = 'pending' and run_at <= now()
+     and (p_client_id is null or client_id = p_client_id)
    order by run_at
    for update skip locked
    limit 1;

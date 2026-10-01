@@ -50,12 +50,20 @@ export async function findClientByPhoneNumberId(
 /**
  * claimDueJob: calls the claim_due_job() SQL function.
  *
+ * Pass `clientId` whenever the caller already knows its tenant: the function
+ * then only considers that tenant's jobs, so a worker can never pick up another
+ * client's work and tests do not depend on what else is in the queue. `null`
+ * keeps the shared-queue behaviour for the Slice 4 poller.
+ *
  * The function returns a row whose `id` is NULL when there was nothing to do, so
  * the id is checked here and the caller gets a plain null instead. Verified
  * behaviour: two workers can never receive the same job (SKIP LOCKED).
  */
-export async function claimDueJob(supabase: SupabaseClient): Promise<Job | null> {
-  const { data, error } = await supabase.rpc('claim_due_job');
+export async function claimDueJob(
+  supabase: SupabaseClient,
+  clientId: string | null = null,
+): Promise<Job | null> {
+  const { data, error } = await supabase.rpc('claim_due_job', { p_client_id: clientId });
   if (error) throw new Error(`claim_due_job failed: ${error.message}`);
   const job = (data ?? null) as Job | null;
   if (!job || !job.id) return null;

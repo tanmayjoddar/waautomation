@@ -123,6 +123,33 @@ export function anonKey(config: AppConfig): string | null {
   return config.supabase.anonKey;
 }
 
+/**
+ * Reserved prefix for every tenant these tests create. A crashed or timed-out run
+ * leaves its client behind, and because `jobs` cascades from `clients` the next
+ * run would then find due jobs in the queue that it did not create.
+ *
+ * Each suite appends its own namespace (`wa-test-fns-`, `wa-test-rls-`, ...) and
+ * purges only that namespace: vitest runs test FILES in parallel, so two suites
+ * sharing a prefix would delete each other's tenants mid-test.
+ */
+export const TEST_CLIENT_PREFIX = 'wa-test-';
+
+/**
+ * Garbage-collects tenants left behind by a previous run of ONE suite that never
+ * cleaned up. `namespace` must include the trailing separator.
+ */
+export async function purgeAbandonedTestTenants(
+  supabase: SupabaseClient,
+  namespace: string,
+  keepClientId: string | null = null,
+): Promise<number> {
+  let query = supabase.from('clients').delete().like('business_name', `${namespace}%`).select('id');
+  if (keepClientId !== null) query = query.neq('id', keepClientId);
+  const { data, error } = await query;
+  if (error) throw new Error(`purgeAbandonedTestTenants failed: ${error.message}`);
+  return data?.length ?? 0;
+}
+
 /** A phone number that cannot collide with a real contact. */
 export const testPhone = (tag: string, n: number): string => `9199${tag.slice(-6)}${String(n).padStart(4, '0')}`;
 

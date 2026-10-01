@@ -6,7 +6,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { seedDemoTenant } from '../../scripts/seed.js';
 import type { Client, Knowledge, Settings } from '../../src/db/types.js';
-import { dbHarness, dbTest, schemaReadiness, type DbHarness } from './harness.js';
+import { dbHarness, dbTest, purgeAbandonedTestTenants, schemaReadiness, TEST_CLIENT_PREFIX, type DbHarness } from './harness.js';
 
 const ready = dbHarness();
 const suiteName = ready.ok
@@ -14,7 +14,8 @@ const suiteName = ready.ok
   : `seed (skipped: ${ready.reason})`;
 
 /** Unique name so a test run never disturbs a real demo client. */
-const TEST_BUSINESS_NAME = 'Seed Test Business';
+const TEST_NAMESPACE = `${TEST_CLIENT_PREFIX}seed-`;
+const TEST_BUSINESS_NAME = TEST_NAMESPACE;
 
 describe.skipIf(!ready.ok)(suiteName, () => {
   let h!: DbHarness;
@@ -27,6 +28,10 @@ describe.skipIf(!ready.ok)(suiteName, () => {
     if (!ready.ok) return;
     h = ready.harness;
     skipReason = await schemaReadiness(h.supabase);
+    if (skipReason !== null) return;
+    // Remove any tenant a crashed earlier run left behind, so "running the seed
+    // again creates no duplicates" really does test a fresh start.
+    await purgeAbandonedTestTenants(h.supabase, TEST_NAMESPACE);
   });
 
   afterAll(async () => {

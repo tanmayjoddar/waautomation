@@ -13,7 +13,17 @@ import { randomBytes } from 'node:crypto';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { createServiceClient } from '../../src/db/supabase.js';
 import type { Booking, Client, Contact } from '../../src/db/types.js';
-import { dbHarness, dbTest, deleteTestClient, retry, schemaReadiness, testPhone, type DbHarness } from './harness.js';
+import {
+  dbHarness,
+  dbTest,
+  deleteTestClient,
+  purgeAbandonedTestTenants,
+  retry,
+  schemaReadiness,
+  TEST_CLIENT_PREFIX,
+  testPhone,
+  type DbHarness,
+} from './harness.js';
 
 const ready = dbHarness();
 const anonMissing =
@@ -91,6 +101,7 @@ describe.skipIf(!ready.ok)(suiteName, () => {
 
     // Admin client, used only to create and delete the throwaway users.
     const admin = createServiceClient(h.config);
+    await purgeAbandonedTestTenants(admin, `${TEST_CLIENT_PREFIX}rls-`);
 
     const userA = await signInAs(h, 'a');
     const userB = await signInAs(h, 'b');
@@ -102,13 +113,13 @@ describe.skipIf(!ready.ok)(suiteName, () => {
     // Two tenants, one owner each.
     const { data: clientA, error: clientAError } = await admin
       .from('clients')
-      .insert({ business_name: `RLS A ${h.tag}`, phone_number_id: `${h.tag}-a` })
+      .insert({ business_name: `${TEST_CLIENT_PREFIX}rls-a-${h.tag}`, phone_number_id: `${h.tag}-a` })
       .select('*')
       .single();
     expect(clientAError).toBeNull();
     const { data: clientB, error: clientBError } = await admin
       .from('clients')
-      .insert({ business_name: `RLS B ${h.tag}`, phone_number_id: `${h.tag}-b` })
+      .insert({ business_name: `${TEST_CLIENT_PREFIX}rls-b-${h.tag}`, phone_number_id: `${h.tag}-b` })
       .select('*')
       .single();
     expect(clientBError).toBeNull();
@@ -189,7 +200,7 @@ describe.skipIf(!ready.ok)(suiteName, () => {
       expect(error).toBeNull();
       const rows = data as Client[];
       expect(rows.map((r) => r.id)).toEqual([fixture.clientAId]);
-      expect(rows.every((r) => r.business_name.startsWith('RLS A'))).toBe(true);
+      expect(rows.every((r) => r.business_name.startsWith(`${TEST_CLIENT_PREFIX}rls-a-`)), 'only A tenant rows').toBe(true);
     }),
   );
 
