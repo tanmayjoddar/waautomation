@@ -84,6 +84,10 @@ export type Message = {
   media_id: string | null;
   transcript: string | null;
   status: string | null;
+  /** Migration 002: Meta's failure reason, written only by failed statuses. */
+  meta_error_code: number | null;
+  meta_error_title: string | null;
+  meta_error_message: string | null;
   created_at: string;
 };
 

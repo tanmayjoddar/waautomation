@@ -241,16 +241,31 @@ export async function insertInboundMessage(
   return (data as Message | null) ?? null;
 }
 
-/** Updates one message's delivery status. Returns false when the wamid is unknown. */
+/**
+ * Updates one message's delivery status. Returns false when the wamid is unknown.
+ *
+ * When the status carries Meta's failure reason (migration 002), the reason is
+ * persisted on the row alongside the status. It is written ONLY on failure and
+ * never cleared: statuses can arrive out of order, and a later event must not
+ * erase the record of the earlier failure. messages.status stays the current
+ * state; meta_error_* is the failure record.
+ */
 export async function updateMessageStatus(
   supabase: SupabaseClient,
   clientId: string,
   wamid: string,
   status: string,
+  failure?: { code: number | null; title: string | null; message: string | null },
 ): Promise<boolean> {
+  const patch: Record<string, unknown> = { status };
+  if (failure && failure.code !== null) {
+    patch.meta_error_code = failure.code;
+    patch.meta_error_title = failure.title;
+    patch.meta_error_message = failure.message;
+  }
   const { data, error } = await supabase
     .from('messages')
-    .update({ status })
+    .update(patch)
     .eq('client_id', clientId)
     .eq('wamid', wamid)
     .select('id');

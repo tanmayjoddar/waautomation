@@ -8,7 +8,7 @@
  * them and make X-Hub-Signature-256 impossible to verify (and impossible to debug
  * when it fails). The webhook route mounts its own raw parser.
  */
-import express, { type Express } from 'express';
+import express, { type Express, type NextFunction, type Request, type Response } from 'express';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Logger } from 'pino';
 import type { AppConfig } from './config.js';
@@ -32,6 +32,22 @@ export type AppDeps = {
 export function createApp({ config, logger, supabase, hooks, ingest }: AppDeps): Express {
   const app = express();
   app.disable('x-powered-by');
+
+  // One debug line per request: method, path, status, duration. This is the
+  // cheapest "is this process serving anything" proof: enable debug logging
+  // and every request, including Meta's, shows up here.
+  // Path ONLY, never req.url: the query string carries hub.verify_token and
+  // hub.challenge, and logging it would print a credential.
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    const started = Date.now();
+    res.on('finish', () => {
+      logger.debug(
+        { method: req.method, path: req.path, status: res.statusCode, durationMs: Date.now() - started },
+        'http request',
+      );
+    });
+    next();
+  });
 
   app.get('/healthz', (_req, res) => {
     res.status(200).json({

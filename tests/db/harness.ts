@@ -45,9 +45,17 @@ export async function retry(
   return false;
 }
 
-async function probeSchema(supabase: SupabaseClient): Promise<string | null> {
+async function probeSchema(supabase: SupabaseClient, requireMessageErrorColumns = false): Promise<string | null> {
   const { error } = await supabase.from('clients').select('id').limit(1);
-  if (!error) return null;
+  if (!error) {
+    if (!requireMessageErrorColumns) return null;
+    // Migration 002: the failed-status write path references these columns, so
+    // a project without them fails those tests with a confusing PostgREST
+    // error instead of a skip. Probe the column directly.
+    const { error: columnError } = await supabase.from('messages').select('meta_error_code').limit(1);
+    if (!columnError) return null;
+    return `002_message_errors.sql has not been applied: run supabase/migrations/002_message_errors.sql in the Supabase SQL Editor first (Postgres said: ${columnError.message})`;
+  }
   const message = error.message;
   if (/does not exist|schema cache|not found/i.test(message)) {
     return `the schema is missing: run supabase/migrations/001_init.sql in the Supabase SQL Editor first (Postgres said: ${message})`;
@@ -60,8 +68,11 @@ async function probeSchema(supabase: SupabaseClient): Promise<string | null> {
  * null. Call it in beforeAll, keep the string, and pass it to `ctx.skip()` in
  * each test.
  */
-export async function schemaReadiness(supabase: SupabaseClient): Promise<string | null> {
-  return probeSchema(supabase);
+export async function schemaReadiness(
+  supabase: SupabaseClient,
+  opts?: { requireMessageErrorColumns?: boolean },
+): Promise<string | null> {
+  return probeSchema(supabase, opts?.requireMessageErrorColumns ?? false);
 }
 
 /** The subset of vitest's TestContext this helper needs. */

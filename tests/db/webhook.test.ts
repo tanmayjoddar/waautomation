@@ -94,7 +94,10 @@ describe.skipIf(!ready.ok)(suiteName, () => {
   beforeAll(async () => {
     if (!ready.ok) return;
     h = ready.harness;
-    skipReason = await schemaReadiness(h.supabase);
+    // The statuses[] tests persist Meta's failure reason (migration 002), so
+    // this suite skips loudly on a project without those columns instead of
+    // failing with a PostgREST error.
+    skipReason = await schemaReadiness(h.supabase, { requireMessageErrorColumns: true });
     if (skipReason !== null) return;
     clientId = await newClient(h, 'main');
   });
@@ -367,6 +370,47 @@ describe.skipIf(!ready.ok)(suiteName, () => {
         errorCode: 131047,
         errorTitle: 'Re-engagement message',
         errorMessage: 'Re-engagement',
+      });
+      // ... and the reason is persisted on the row itself (migration 002).
+      const row = (await messages()).find((m) => m.wamid === wamid);
+      expect(row).toMatchObject({
+        status: 'failed',
+        meta_error_code: 131047,
+        meta_error_title: 'Re-engagement message',
+        meta_error_message: 'Re-engagement',
+      });
+    }));
+
+    it('a later clean status does not erase the failure record', test(async () => {
+      // Migration 002 semantics, pinned end to end: the error columns record
+      // the latest FAILURE and are never cleared by a later status, because
+      // statuses can arrive out of order. messages.status stays current.
+      const faulted = `wamid.OUTBOUND.FAULT.${h.tag}`;
+      const { data: contact } = await h.supabase.from('contacts').select('id').eq('client_id', clientId).limit(1).single();
+      await h.supabase.from('messages').insert({
+        client_id: clientId,
+        contact_id: (contact as { id: string }).id,
+        wamid: faulted,
+        direction: 'out',
+        type: 'text',
+        text: 'will fail, then deliver',
+        status: 'sent',
+      });
+      const failed = {
+        id: faulted,
+        status: 'failed',
+        timestamp: String(Math.floor(Date.now() / 1000)),
+        errors: [{ code: 131026, error_data: { details: 'Not on WhatsApp' }, title: 'Message undeliverable' }],
+      };
+      await run(payload(`${h.tag}-main`, { statuses: [failed] }));
+      await run(payload(`${h.tag}-main`, { statuses: [{ id: faulted, status: 'delivered', timestamp: String(Math.floor(Date.now() / 1000)) }] }));
+
+      const row = (await messages()).find((m) => m.wamid === faulted);
+      expect(row).toMatchObject({
+        status: 'delivered',
+        meta_error_code: 131026,
+        meta_error_title: 'Message undeliverable',
+        meta_error_message: 'Not on WhatsApp',
       });
     }));
 

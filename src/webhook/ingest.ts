@@ -126,7 +126,11 @@ async function handleStatus(
   status: { wamid: string; status: string; errorCode: number | null; errorTitle: string | null; errorMessage: string | null },
   summary: IngestSummary,
 ): Promise<void> {
-  const applied = await updateMessageStatus(deps.supabase, clientId, status.wamid, status.status);
+  const applied = await updateMessageStatus(deps.supabase, clientId, status.wamid, status.status, {
+    code: status.errorCode,
+    title: status.errorTitle,
+    message: status.errorMessage,
+  });
   if (!applied) {
     // Unknown wamids are INFO, not debug: a failed status for a message we
     // never stored (sent before the retention window, or sent by hand while
