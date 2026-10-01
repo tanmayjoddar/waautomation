@@ -1,44 +1,55 @@
 /**
- * Interactive console chat (Slice 3): talk to the bot as a fake customer of
- * the demo client, without Meta delivery.
+ * Interactive console chat (Slice 4): talk to the REAL worker as a fake
+ * customer of the demo client, without Meta delivery.
  *
- *   npm run chat
+ *   npm run chat            # SEND_MODE must be console
  *
- * Each line you type runs the REAL ingest pipeline (contact upsert, dedupe,
- * message store, reply job enqueue, echo hooks) against the demo tenant, with
- * a fake WhatsApp client standing in for Meta: the reply prints here and the
- * out row is saved with a fake wamid. The debounce is skipped (delay 0), so
- * the reply comes back immediately instead of waiting for a worker.
+ * Each line you type goes through the SAME inbound function as the webhook
+ * (ingestWebhookPayload), then the real worker runs in-process: scoped claim,
+ * pipeline, settle, until the queue is quiet. Replies print here. The debounce
+ * is skipped (delay 0), so the answer comes back immediately.
+ *
+ * Refuses to run unless SEND_MODE=console: with live sends every turn would
+ * attempt a real WhatsApp delivery. Demo client only, enforced twice (config
+ * gate here, factory gate on every send).
  *
  * The fake customer is one fixed contact. Its rows live in the demo tenant
  * while you chat (open Table Editor mid-session to inspect them) and are
- * deleted on exit: the contact cascades to messages/jobs, and the contact's
- * sheet_outbox rows (no foreign key) are removed explicitly first.
+ * deleted on exit: contacts cascade to messages/jobs, the contact's
+ * sheet_outbox rows (no foreign key) are removed explicitly first, and
+ * usage_log rows from this session are removed by timestamp.
  */
 import { pathToFileURL } from 'node:url';
 import * as readline from 'node:readline';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Logger } from 'pino';
 import { loadEnvFromFile, type AppConfig } from '../src/config.js';
-import { createServiceClient } from '../src/db/supabase.js';
+import { claimDueJob, createServiceClient } from '../src/db/supabase.js';
 import { createLogger } from '../src/logger.js';
-import { handleStoredMessageForEcho, type EchoDeps } from '../src/services/echo.js';
-import { consoleClient } from '../src/whatsapp/sendMode.js';
-import { createFakeWhatsAppClient } from '../src/whatsapp/fake.js';
+import { consoleNotifier, type PipelineDeps } from '../src/jobs/pipeline.js';
+import { settleJob } from '../src/jobs/worker.js';
+import { createLlmAdapter } from '../src/ai/index.js';
+import type { LlmAdapter } from '../src/ai/llm.js';
 import { ingestWebhookPayload, type IngestSummary } from '../src/webhook/ingest.js';
 
 /** Fixed fake customer number (E.164 digits). Never a real phone. */
 export const CHAT_CONTACT_PHONE = '15550001111';
 const CHAT_PROFILE_NAME = 'Chat Tester';
+/** Worker-drive iterations per turn: enough for retries, bounded against loops. */
+const MAX_DRAIN_ITERATIONS = 10;
 
 export type ChatDeps = {
   supabase: SupabaseClient;
   logger: Logger;
+  llm: LlmAdapter;
+  llmConfig: NonNullable<AppConfig['llm']>;
+  config: AppConfig;
   demoClientId: string;
   demoPhoneNumberId: string;
   contactPhone?: string;
   /** Prints lines to the human. Defaults to process.stdout. */
   out?: { write(chunk: string): void };
+  sendGapMs?: number;
 };
 
 export type ChatReply = { summary: IngestSummary; replies: string[] };
@@ -46,10 +57,15 @@ export type ChatReply = { summary: IngestSummary; replies: string[] };
 let chatCounter = 0;
 
 /**
- * One chat turn: stores the typed text through the real pipeline and returns
- * whatever replies the (fake) sends produced. Exported for tests.
+ * One chat turn: the typed text through ingest, then the real worker until
+ * quiet. Returns the saved reply texts. Exported for tests. SEND_MODE must
+ * be console: this function sends through the pipeline's factory, and live
+ * mode would attempt real deliveries.
  */
 export async function chatOnce(deps: ChatDeps, text: string): Promise<ChatReply> {
+  if (deps.config.sendMode !== 'console') {
+    throw new Error('chat runs in console mode only: set SEND_MODE=console so nothing reaches Meta.');
+  }
   const phone = deps.contactPhone ?? CHAT_CONTACT_PHONE;
   const out = deps.out ?? process.stdout;
   chatCounter += 1;
@@ -83,43 +99,66 @@ export async function chatOnce(deps: ChatDeps, text: string): Promise<ChatReply>
     ],
   };
 
-  const sender = consoleClient(createFakeWhatsAppClient(), out);
-  const echo: EchoDeps = {
-    supabase: deps.supabase,
-    whatsapp: sender,
-    logger: deps.logger,
-    demoClientId: deps.demoClientId,
-  };
-  // Debounce skipped: delay 0 puts the job due now instead of waiting for a
-  // worker that does not exist yet (Slice 4 owns the worker).
+  // Same inbound function as the webhook. No hooks: the worker below does the
+  // replying, exactly like production (the echo is gone in Slice 4).
+  // Debounce skipped: delay 0 puts the job due now.
   const summary = await ingestWebhookPayload(
-    {
-      supabase: deps.supabase,
-      logger: deps.logger,
-      debounceSeconds: 0,
-      hooks: {
-        onMessageStored: async (info) => {
-          await handleStoredMessageForEcho(echo, info);
-        },
-      },
-    },
+    { supabase: deps.supabase, logger: deps.logger, debounceSeconds: 0 },
     payload,
   );
-  return { summary, replies: sender.fake.sent.map((s) => s.body) };
+
+  // The real worker, in-process and demo-scoped: claim, settle, repeat until
+  // the queue is quiet. Replies print through the console factory; the saved
+  // part texts are collected here for a clean transcript.
+  const pipeline: Omit<PipelineDeps, 'config'> & { config: AppConfig } = {
+    supabase: deps.supabase,
+    logger: deps.logger,
+    llm: deps.llm,
+    llmConfig: deps.llmConfig,
+    config: deps.config,
+    notifier: consoleNotifier(deps.logger),
+    sendGapMs: deps.sendGapMs ?? 0,
+    // Swallowed on purpose: the factory would print every reply itself, and
+    // this script prints its own cleaner `bot>` transcript below instead.
+    consoleOut: { write: () => undefined },
+  };
+  const replies: string[] = [];
+  for (let i = 0; i < MAX_DRAIN_ITERATIONS; i += 1) {
+    const job = await claimDueJob(deps.supabase, deps.demoClientId);
+    if (job === null) break;
+    await settleJob(deps.supabase, deps.logger, pipeline, job);
+    const { data } = await deps.supabase
+      .from('messages')
+      .select('text')
+      .eq('job_id', job.id)
+      .order('part_index');
+    for (const row of (data ?? []) as Array<{ text: string | null }>) {
+      if (row.text !== null && !replies.includes(row.text)) {
+        replies.push(row.text);
+        out.write(`bot> ${row.text}\n`);
+      }
+    }
+  }
+  return { summary, replies };
 }
 
-/** Removes everything this script wrote: the chat contact and its orphans. */
+/**
+ * Removes everything this script wrote: messages, jobs and usage rows plus
+ * the contact itself. Contacts cascade to messages/jobs; sheet_outbox rows
+ * (no foreign key) and usage_log rows (per client, no contact link) are
+ * removed explicitly first.
+ */
 export async function cleanupChatRows(
   supabase: SupabaseClient,
   clientId: string,
   contactPhone: string = CHAT_CONTACT_PHONE,
-): Promise<{ contacts: number; sheetOutbox: number }> {
+  usageSinceIso: string | null = null,
+): Promise<{ contacts: number; sheetOutbox: number; usageLog: number }> {
   const { data: contacts, error } = await supabase.from('contacts').select('id').eq('client_id', clientId).eq('phone', contactPhone);
   if (error) throw new Error(`cannot list chat contacts: ${error.message}`);
   const ids = (contacts ?? []).map((c) => c.id as string);
-  if (ids.length === 0) return { contacts: 0, sheetOutbox: 0 };
+  if (ids.length === 0) return { contacts: 0, sheetOutbox: 0, usageLog: 0 };
 
-  // sheet_outbox.entity_id has no foreign key: delete explicitly first.
   const { data: outbox, error: outboxError } = await supabase
     .from('sheet_outbox')
     .delete()
@@ -131,7 +170,19 @@ export async function cleanupChatRows(
 
   const { data: removed, error: contactError } = await supabase.from('contacts').delete().in('id', ids).select('id');
   if (contactError) throw new Error(`cannot delete chat contacts: ${contactError.message}`);
-  return { contacts: removed?.length ?? 0, sheetOutbox: outbox?.length ?? 0 };
+
+  let usageLog = 0;
+  if (usageSinceIso !== null) {
+    const { data: usage, error: usageError } = await supabase
+      .from('usage_log')
+      .delete()
+      .eq('client_id', clientId)
+      .gte('created_at', usageSinceIso)
+      .select('id');
+    if (usageError) throw new Error(`cannot delete chat usage rows: ${usageError.message}`);
+    usageLog = usage?.length ?? 0;
+  }
+  return { contacts: removed?.length ?? 0, sheetOutbox: outbox?.length ?? 0, usageLog };
 }
 
 function fail(message: string): never {
@@ -145,9 +196,16 @@ const isMain = process.argv[1] !== undefined && import.meta.url === pathToFileUR
 if (isMain) {
   const run = async (): Promise<void> => {
     const config: AppConfig = loadEnvFromFile();
+    if (config.sendMode !== 'console') {
+      fail('chat refuses to run with SEND_MODE=live: every turn would attempt a real WhatsApp delivery. Set SEND_MODE=console.');
+    }
     if (config.whatsappDemo === null) {
       fail('Demo WhatsApp config is missing: set WA_PHONE_NUMBER_ID and WA_TOKEN in .env first.');
     }
+    if (config.llm === null) {
+      fail('No LLM configured: set LLM_PROVIDER, LLM_API_KEY and LLM_MODEL first (LLM_PROVIDER=fake works offline, free).');
+    }
+    const sessionStart = new Date().toISOString();
     const logger = createLogger({ level: config.logLevel });
     const supabase = createServiceClient(config);
     const { data: demo, error } = await supabase
@@ -160,8 +218,9 @@ if (isMain) {
 
     const demoId = (demo as { id: string }).id;
     const demoName = (demo as { business_name: string }).business_name;
-    process.stdout.write(`Chatting with "${demoName}" as a fake customer (SEND_MODE is irrelevant here: sends never reach Meta).\n`);
-    process.stdout.write(`Rows live in the demo tenant while you chat; they are deleted on exit. Type /quit to leave.\n`);
+    const llm = createLlmAdapter(config.llm, logger);
+    process.stdout.write(`Chatting with "${demoName}" (${config.llm.provider}) as a fake customer. Real worker, console sends.\n`);
+    process.stdout.write('Rows live in the demo tenant while you chat; they are deleted on exit. Type /quit to leave.\n');
 
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: 'you> ' });
     let closed = false;
@@ -169,8 +228,8 @@ if (isMain) {
       if (closed) return;
       closed = true;
       try {
-        const removed = await cleanupChatRows(supabase, demoId);
-        process.stdout.write(`\nCleaned up ${removed.contacts} chat contact(s) and ${removed.sheetOutbox} sheet row(s).\n`);
+        const removed = await cleanupChatRows(supabase, demoId, CHAT_CONTACT_PHONE, sessionStart);
+        process.stdout.write(`\nCleaned up ${removed.contacts} chat contact(s), ${removed.sheetOutbox} sheet row(s), ${removed.usageLog} usage row(s).\n`);
       } catch (err) {
         process.stderr.write(`\nCleanup failed (rows may remain - delete the ${CHAT_CONTACT_PHONE} contact by hand): ${err instanceof Error ? err.message : String(err)}\n`);
       }
@@ -188,15 +247,19 @@ if (isMain) {
         continue;
       }
       try {
-        const { summary, replies } = await chatOnce(
-          { supabase, logger, demoClientId: demoId, demoPhoneNumberId: (config.whatsappDemo as { phoneNumberId: string }).phoneNumberId },
+        const { summary } = await chatOnce(
+          {
+            supabase,
+            logger,
+            llm,
+            llmConfig: config.llm,
+            config,
+            demoClientId: demoId,
+            demoPhoneNumberId: (config.whatsappDemo as { phoneNumberId: string }).phoneNumberId,
+          },
           text,
         );
-        if (replies.length === 0) {
-          process.stdout.write(`bot> (no reply - stored:${summary.stored} jobs:${summary.jobsEnqueued})\n`);
-        } else {
-          for (const reply of replies) process.stdout.write(`bot> ${reply}\n`);
-        }
+        if (summary.stored === 0) process.stdout.write('(that delivery was a duplicate: stored nothing)\n');
       } catch (err) {
         process.stderr.write(`chat turn failed: ${err instanceof Error ? err.message : String(err)}\n`);
       }

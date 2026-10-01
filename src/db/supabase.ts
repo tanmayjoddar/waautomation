@@ -7,7 +7,7 @@
  */
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import type { AppConfig } from '../config.js';
-import type { Client, ClientStats, Contact, Job, Message } from './types.js';
+import type { Client, ClientStats, Contact, Job, Knowledge, Message, Settings } from './types.js';
 
 /**
  * Service-role client for the server and for scripts/tests.
@@ -285,6 +285,222 @@ export async function queueSheetContact(
     entity_id: contactId,
   });
   if (error) throw new Error(`queueSheetContact failed: ${error.message}`);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Slice 4 worker helpers. Every read/write below is scoped by client_id       */
+/* (or contact_id within a known client), except claimDueJob/requeueStaleJobs, */
+/* which are the documented global-queue exceptions.                           */
+/* -------------------------------------------------------------------------- */
+
+/** Marks a finished job done. */
+export async function markJobDone(supabase: SupabaseClient, jobId: string): Promise<void> {
+  const { error } = await supabase.from('jobs').update({ status: 'done' }).eq('id', jobId);
+  if (error) throw new Error(`markJobDone failed: ${error.message}`);
+}
+
+/**
+ * Records a job failure. attempts was already incremented at claim time:
+ * attempts >= 3 exhausts the retries (failed + last_error), otherwise the job
+ * goes back to pending with run_at pushed out as backoff (30s per attempt).
+ */
+export async function failJob(supabase: SupabaseClient, job: Job, errorMessage: string): Promise<'retried' | 'failed'> {
+  if (job.attempts >= 3) {
+    const { error } = await supabase.from('jobs').update({ status: 'failed', last_error: errorMessage }).eq('id', job.id);
+    if (error) throw new Error(`failJob failed: ${error.message}`);
+    return 'failed';
+  }
+  const backoffSeconds = 30 * job.attempts;
+  const { error } = await supabase
+    .from('jobs')
+    .update({ status: 'pending', started_at: null, last_error: errorMessage, run_at: new Date(Date.now() + backoffSeconds * 1000).toISOString() })
+    .eq('id', job.id);
+  if (error) throw new Error(`failJob failed: ${error.message}`);
+  return 'retried';
+}
+
+/** requeue_stale_jobs(): returns how many running jobs went back to pending/failed. */
+export async function requeueStaleJobs(supabase: SupabaseClient, minutes: number): Promise<number> {
+  const { data, error } = await supabase.rpc('requeue_stale_jobs', { p_minutes: minutes });
+  if (error) throw new Error(`requeue_stale_jobs failed: ${error.message}`);
+  return (data ?? 0) as number;
+}
+
+/** Already-sent parts of a job, oldest first. A retry resumes from these. */
+export async function listJobParts(supabase: SupabaseClient, jobId: string): Promise<Message[]> {
+  const { data, error } = await supabase
+    .from('messages')
+    .select('*')
+    .eq('job_id', jobId)
+    .order('part_index');
+  if (error) throw new Error(`listJobParts failed: ${error.message}`);
+  return (data ?? []) as Message[];
+}
+
+/**
+ * Inserts one reply part tagged with (job_id, part_index). Idempotent: the
+ * partial unique index makes a re-insert of the same part a no-op that returns
+ * the existing row, so a retried job never duplicates a part.
+ */
+export async function insertJobPart(
+  supabase: SupabaseClient,
+  row: { clientId: string; contactId: string; jobId: string; partIndex: number; text: string },
+): Promise<{ message: Message; created: boolean }> {
+  const { data, error } = await supabase
+    .from('messages')
+    .insert({
+      client_id: row.clientId,
+      contact_id: row.contactId,
+      wamid: null,
+      direction: 'out',
+      type: 'text',
+      text: row.text,
+      job_id: row.jobId,
+      part_index: row.partIndex,
+    })
+    .select('*')
+    .maybeSingle();
+  if (error && error.code !== '23505') throw new Error(`insertJobPart failed: ${error.message}`);
+  if (!error && data) return { message: data as Message, created: true };
+  const { data: existing, error: readError } = await supabase
+    .from('messages')
+    .select('*')
+    .eq('job_id', row.jobId)
+    .eq('part_index', row.partIndex)
+    .single();
+  if (readError) throw new Error(`insertJobPart re-read failed: ${readError.message}`);
+  return { message: existing as Message, created: false };
+}
+
+/** Records Meta's wamid once a part is sent. */
+export async function setJobPartWamid(supabase: SupabaseClient, messageId: string, wamid: string): Promise<void> {
+  const { error } = await supabase.from('messages').update({ wamid }).eq('id', messageId);
+  if (error) throw new Error(`setJobPartWamid failed: ${error.message}`);
+}
+
+/** Scoped contact read: id AND client_id, so a job can never load another tenant's contact. */
+export async function loadContact(supabase: SupabaseClient, clientId: string, contactId: string): Promise<Contact | null> {
+  const { data, error } = await supabase
+    .from('contacts')
+    .select('*')
+    .eq('id', contactId)
+    .eq('client_id', clientId)
+    .maybeSingle();
+  if (error) throw new Error(`loadContact failed: ${error.message}`);
+  return (data as Contact | null) ?? null;
+}
+
+/** Scoped contact patch (handover flags, name/language learning). */
+export async function updateContact(
+  supabase: SupabaseClient,
+  clientId: string,
+  contactId: string,
+  patch: Partial<Pick<Contact, 'bot_paused' | 'status' | 'name' | 'language'>>,
+): Promise<Contact> {
+  const { data, error } = await supabase
+    .from('contacts')
+    .update(patch)
+    .eq('id', contactId)
+    .eq('client_id', clientId)
+    .select('*')
+    .single();
+  if (error) throw new Error(`updateContact failed: ${error.message}`);
+  return data as Contact;
+}
+
+/** Client + settings + knowledge, all for one tenant. */
+export async function loadClientBundle(
+  supabase: SupabaseClient,
+  clientId: string,
+): Promise<{ client: Client | null; settings: Settings | null; knowledge: Knowledge[] }> {
+  const { data: client, error: clientError } = await supabase.from('clients').select('*').eq('id', clientId).maybeSingle();
+  if (clientError) throw new Error(`loadClientBundle client failed: ${clientError.message}`);
+  const { data: settings, error: settingsError } = await supabase.from('settings').select('*').eq('client_id', clientId).maybeSingle();
+  if (settingsError) throw new Error(`loadClientBundle settings failed: ${settingsError.message}`);
+  const { data: knowledge, error: knowledgeError } = await supabase.from('knowledge').select('*').eq('client_id', clientId);
+  if (knowledgeError) throw new Error(`loadClientBundle knowledge failed: ${knowledgeError.message}`);
+  return { client: (client as Client | null) ?? null, settings: (settings as Settings | null) ?? null, knowledge: (knowledge ?? []) as Knowledge[] };
+}
+
+/** Messages of one contact, oldest first (history + unanswered computation). */
+export async function listContactMessages(supabase: SupabaseClient, clientId: string, contactId: string): Promise<Message[]> {
+  const { data, error } = await supabase
+    .from('messages')
+    .select('*')
+    .eq('client_id', clientId)
+    .eq('contact_id', contactId)
+    .order('seq');
+  if (error) throw new Error(`listContactMessages failed: ${error.message}`);
+  return (data ?? []) as Message[];
+}
+
+/** Inbound messages for a contact since an ISO instant (rate-limit window). */
+export async function countRecentInbound(
+  supabase: SupabaseClient,
+  clientId: string,
+  contactId: string,
+  sinceIso: string,
+): Promise<number> {
+  const { count, error } = await supabase
+    .from('messages')
+    .select('id', { count: 'exact', head: true })
+    .eq('client_id', clientId)
+    .eq('contact_id', contactId)
+    .eq('direction', 'in')
+    .gte('created_at', sinceIso);
+  if (error) throw new Error(`countRecentInbound failed: ${error.message}`);
+  return count ?? 0;
+}
+
+/** LLM calls for a client since a UTC-midnight ISO instant (daily cap). */
+export async function countLlmCallsSince(
+  supabase: SupabaseClient,
+  clientId: string,
+  sinceIso: string,
+): Promise<number> {
+  const { count, error } = await supabase
+    .from('usage_log')
+    .select('id', { count: 'exact', head: true })
+    .eq('client_id', clientId)
+    .eq('kind', 'llm')
+    .gte('created_at', sinceIso);
+  if (error) throw new Error(`countLlmCallsSince failed: ${error.message}`);
+  return count ?? 0;
+}
+
+/** True when this contact recently got exactly this outbound text (notice/fallback dedupe). */
+export async function recentOutboundWithText(
+  supabase: SupabaseClient,
+  clientId: string,
+  contactId: string,
+  text: string,
+  sinceIso: string,
+): Promise<boolean> {
+  const { data, error } = await supabase
+    .from('messages')
+    .select('id')
+    .eq('client_id', clientId)
+    .eq('contact_id', contactId)
+    .eq('direction', 'out')
+    .eq('text', text)
+    .gte('created_at', sinceIso)
+    .limit(1);
+  if (error) throw new Error(`recentOutboundWithText failed: ${error.message}`);
+  return (data ?? []).length > 0;
+}
+
+/** usage_log write (kind llm | stt). Units are tokens (llm) or seconds (stt). */
+export async function writeUsageLog(
+  supabase: SupabaseClient,
+  row: { clientId: string; kind: 'llm' | 'stt'; units: number; estCost: number | null },
+): Promise<void> {
+  const { error } = await supabase.from('usage_log').insert({
+    client_id: row.clientId,
+    kind: row.kind,
+    units: row.units,
+    est_cost: row.estCost,
+  });
+  if (error) throw new Error(`writeUsageLog failed: ${error.message}`);
 }
 
 /**

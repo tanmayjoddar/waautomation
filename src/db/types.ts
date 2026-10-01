@@ -84,6 +84,9 @@ export type Message = {
   media_id: string | null;
   transcript: string | null;
   status: string | null;
+  /** Migration 003: the reply job this outbound part belongs to (worker sends). */
+  job_id: string | null;
+  part_index: number | null;
   /** Migration 002: Meta's failure reason, written only by failed statuses. */
   meta_error_code: number | null;
   meta_error_title: string | null;
@@ -130,6 +133,8 @@ export type Job = {
   run_at: string;
   status: 'pending' | 'running' | 'done' | 'failed';
   attempts: number;
+  /** Set when claimed (migration 003); NULL while pending or requeued. */
+  started_at: string | null;
   last_error: string | null;
   created_at: string;
 };

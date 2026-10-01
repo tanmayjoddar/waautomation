@@ -188,6 +188,13 @@ describe.skipIf(!ready.ok)(suiteName, () => {
       expect(looksLikePermissionDenial(error?.message ?? ''), `unexpected error: ${error?.message}`).toBe(true);
     }));
 
+    it('cannot call requeue_stale_jobs (migration 003 re-asserted the grants)', anonTest(async () => {
+      const { error, data } = await anon().rpc('requeue_stale_jobs', { p_minutes: 5 });
+      expect(error, 'anon was allowed to call requeue_stale_jobs').not.toBeNull();
+      expect(looksLikePermissionDenial(error?.message ?? ''), `unexpected error: ${error?.message}`).toBe(true);
+      expect(data ?? null).toBeNull();
+    }));
+
     it('cannot claim the queued job even with the correct arguments', anonTest(async () => {
       await enqueueReplyJob(h.supabase, clientId, (await contactId(1)).id, 0);
 
@@ -253,24 +260,19 @@ describe.skipIf(!ready.ok)(suiteName, () => {
       expect(stats.bookings).toBeGreaterThanOrEqual(0);
     }));
 
-    it('can call enqueue_reply_job and claim the job, including the global path', test(async () => {
+    it('can call enqueue_reply_job and claim the job with a tenant scope', test(async () => {
       const contact = await contactId(2);
       await enqueueReplyJob(h.supabase, clientId, contact.id, 0);
 
       const scoped = await claimDueJob(h.supabase, clientId);
       expect(scoped, 'the scoped claim returned nothing').not.toBeNull();
       expect(scoped?.client_id).toBe(clientId);
-
-      await enqueueReplyJob(h.supabase, clientId, contact.id, 0);
-
-      // The global queue is shared, so a parallel suite may claim our job first.
-      // Keep claiming until this client's job turns up.
-      let mine: { client_id: string } | null = null;
-      for (let attempt = 0; attempt < 5 && mine === null; attempt += 1) {
-        const job = await claimDueJob(h.supabase, null);
-        if (job?.client_id === clientId) mine = job;
-      }
-      expect(mine, 'the global claim never returned this client\'s job').not.toBeNull();
+      // NOTE: no claim_due_job(null) here on purpose. A global claim takes the
+      // earliest due job of ANY tenant, so under parallel suites it steals
+      // other files' due jobs: their scoped claim then returns null and their
+      // test fails. That was the root cause of the flaky functions.test.ts
+      // 'requeue' failure (proven by replay, not by timing luck). The NULL
+      // path belongs to the Slice 4 worker at runtime, never to a test.
     }));
   });
 

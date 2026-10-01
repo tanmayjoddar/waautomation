@@ -148,32 +148,41 @@ All Meta calls live in `src/whatsapp/client.ts`: `sendText` and
 (see the links at the top of `client.ts`); the failure envelope is assumed to be
 the standard Graph shape and is marked `[VERIFY]` in the code.
 
-Slice 3 also ships a **temporary** echo so the loop can be tested with a real
-phone before the Slice 4 worker exists: with `ECHO_MODE=true`, an inbound
-**text** to the **demo client** (the one with `WA_PHONE_NUMBER_ID`) gets
-`"I got: <text>"` back, after a `markReadAndType` so the phone shows
-"typing...". Rules: demo client only (resolved to a client id at startup, so a
-wiring mistake fails closed), duplicates never re-send (the hook fires only for
-newly stored rows), the outbound row is saved with Meta's wamid, and a Meta/DB
-failure is logged without breaking ingest. Slice 4 deletes `src/services/echo.ts`
-and this flag.
-
-```bash
-ECHO_MODE=true   # in .env, then restart the server
-```
-
-Turn it back to `false` before running the simulator: every sample would
-otherwise attempt a real send to an invalid number (logged as failed, harmless,
-but noisy). `tests/whatsapp/fake.ts` (`createFakeWhatsAppClient`) is the fake
-later slices' worker tests will use.
-
 Testing without Meta delivery: `SEND_MODE=live` (default) sends for real;
 `SEND_MODE=console` uses the fake for the **demo client only** (any other
-client is refused with an error). Console replies print to stdout — never to
-the logs — and the out row is still saved with a fake wamid. `npm run chat`
-is the interactive version: type as a fake customer of the demo client, the
-real ingest pipeline answers immediately (debounce skipped), rows live in the
-demo tenant while you chat and are deleted on exit.
+client is refused with an error). Console replies print to stdout - never to
+the logs - and the out row is still saved with a fake wamid.
+
+## Reply worker + LLM brain (Slice 4)
+
+`npm run dev` answers queued messages when `WORKER_ENABLED=true` (default) and
+the `LLM_*` trio is set; without the trio the webhook still runs but the
+worker stays down (warned once). The worker polls every `WORKER_POLL_MS`,
+runs up to `WORKER_CONCURRENCY` jobs, reaps stale jobs every minute, and stops
+claiming on SIGINT/SIGTERM (15s cap on in-flight jobs).
+
+The pipeline per job: skip paused/answered/older-than-24h, per-phone rate
+limit (`RATE_LIMIT_MESSAGES` per `RATE_LIMIT_WINDOW_SECONDS`, one slow-down
+notice per 10 min), per-client daily LLM cap, voice-note notice (Slice 5 does
+audio), LLM call with one JSON retry then fallback, code post-checks (prices
+must come from knowledge, no prompt copies, max 3 parts), intent handling
+(`human`/low confidence pauses + staff alert, `book` sets hot without a
+booking row), cooldown-checked fallback (`Thanks! Our team will confirm this
+shortly.`). Reply parts persist with `(job_id, part_index)` before sending,
+so a retried job resumes instead of duplicating. No booking rows are created
+in this slice; per-client tokens live AES-GCM encrypted in `wa_token_enc`.
+
+```bash
+npm run chat        # SEND_MODE=console required: fake customer, real worker, cleaned up on exit
+npm run resume -- <phone>   # bot_paused=false, status=new for a demo-client contact
+npm run eval        # ~25 canned conversations vs the real LLM (free-tier $0); prints pass/fail + transcripts
+```
+
+Costs stay at $0 while testing: `npm test` and `npm run chat` use fake/mocked
+providers only. Eval uses your free-tier key (~60 calls vs ~1500/day quota).
+Production guards are already in the code: daily caps, rate limits, 429
+backoff with Retry-After, token budgets, `usage_log` cost tracking, no
+paid-only provider features.
 
 ## Local smoke test
 
@@ -193,8 +202,8 @@ phone numbers are redacted (`919812345678` -> `91********78`).
 | **0** | Scaffold, `config.ts`, `.env.example`, logging, vitest, `.gitignore` | **done** |
 | **1** | Migration SQL, Supabase client, seed script, RLS and function tests | **done** (88 tests green against a real project) |
 | **2** | Webhook GET/POST, signature verification, dedupe, `simulate-webhook.ts` | **done** (code done; the live suites need the updated migration re-run) |
-| 3 | WhatsApp client adapter (`sendText`, `markReadAndType`), temporary demo echo | **done** (mocked adapter tests + live echo tests against a fake client) |
-| 4 | Worker + debounce + LLM adapter + prompt + zod schema | not started |
+| 3 | WhatsApp client adapter (`sendText`, `markReadAndType`), console send mode | **done** |
+| 4 | Worker + debounce + LLM adapter + prompt + zod schema, eval script | **done** |
 | 5 | Voice notes: media download + STT adapter | not started |
 | 6 | Human-like pacing | not started |
 | 7 | Slots + bookings + confirmation | not started |

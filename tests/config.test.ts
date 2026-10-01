@@ -76,7 +76,7 @@ describe('loadEnv - feature groups', () => {
       }),
     );
     expect(config.features.llm).toBe(true);
-    expect(config.llm).toEqual({ provider: 'fake', apiKey: 'not-used', model: 'canned' });
+    expect(config.llm).toEqual({ provider: 'fake', apiKey: 'not-used', model: 'canned', timeoutMs: 20000, maxOutputTokens: 400 });
     expect(config.stt).toBeNull();
   });
 
@@ -481,22 +481,6 @@ describe('.env.example stays in sync with config.ts', () => {
   });
 });
 
-describe('ECHO_MODE (Slice 3 only, removed in Slice 4)', () => {
-  it('defaults to false', () => {
-    expect(loadEnv(baseEnv()).echoMode).toBe(false);
-  });
-
-  it('enables the demo echo on exactly "true"', () => {
-    expect(loadEnv(baseEnv({ ECHO_MODE: 'true' })).echoMode).toBe(true);
-    expect(loadEnv(baseEnv({ ECHO_MODE: 'false' })).echoMode).toBe(false);
-  });
-
-  it('rejects anything else: a truthy-looking typo must never mean "send real messages"', () => {
-    expect(() => loadEnv(baseEnv({ ECHO_MODE: 'yes' }))).toThrow(EnvError);
-    expect(() => loadEnv(baseEnv({ ECHO_MODE: '1' }))).toThrow(EnvError);
-  });
-});
-
 describe('SEND_MODE', () => {
   it('defaults to live', () => {
     expect(loadEnv(baseEnv()).sendMode).toBe('live');
@@ -509,5 +493,50 @@ describe('SEND_MODE', () => {
   it('rejects anything else', () => {
     expect(() => loadEnv(baseEnv({ SEND_MODE: 'off' }))).toThrow(EnvError);
     expect(() => loadEnv(baseEnv({ SEND_MODE: 'CONSOLE' }))).toThrow(EnvError);
+  });
+});
+
+describe('Slice 4 worker config', () => {
+  it('carries documented defaults', () => {
+    const config = loadEnv(baseEnv());
+    expect(config.worker).toEqual({ enabled: true, pollMs: 1000, concurrency: 2 });
+    expect(config.rateLimit).toEqual({ messages: 20, windowSeconds: 60 });
+    expect(config.dailyLlmCap).toBe(2000);
+    expect(config.fallbackCooldownSeconds).toBe(600);
+    expect(config.llmPrices).toBeNull();
+    expect(config.llm).toBeNull();
+  });
+
+  it('parses every worker variable', () => {
+    const config = loadEnv(
+      baseEnv({
+        WORKER_ENABLED: 'false',
+        WORKER_POLL_MS: '500',
+        WORKER_CONCURRENCY: '4',
+        LLM_TIMEOUT_MS: '15000',
+        LLM_MAX_OUTPUT_TOKENS: '200',
+        RATE_LIMIT_MESSAGES: '10',
+        RATE_LIMIT_WINDOW_SECONDS: '120',
+        MAX_LLM_CALLS_PER_CLIENT_PER_DAY: '100',
+        FALLBACK_COOLDOWN_SECONDS: '60',
+        LLM_PRICE_IN_PER_MTOK: '0.75',
+        LLM_PRICE_OUT_PER_MTOK: '3.75',
+        LLM_PROVIDER: 'gemini',
+        LLM_API_KEY: 'test-llm-key',
+        LLM_MODEL: 'gemini-3.8-flash',
+      }),
+    );
+    expect(config.worker).toEqual({ enabled: false, pollMs: 500, concurrency: 4 });
+    expect(config.llm).toMatchObject({ provider: 'gemini', model: 'gemini-3.8-flash', timeoutMs: 15000, maxOutputTokens: 200 });
+    expect(config.rateLimit).toEqual({ messages: 10, windowSeconds: 120 });
+    expect(config.dailyLlmCap).toBe(100);
+    expect(config.fallbackCooldownSeconds).toBe(60);
+    expect(config.llmPrices).toEqual({ inPerMtok: 0.75, outPerMtok: 3.75 });
+  });
+
+  it('rejects out-of-range worker variables', () => {
+    expect(() => loadEnv(baseEnv({ WORKER_POLL_MS: '5' }))).toThrow(EnvError);
+    expect(() => loadEnv(baseEnv({ WORKER_CONCURRENCY: '0' }))).toThrow(EnvError);
+    expect(() => loadEnv(baseEnv({ WORKER_ENABLED: 'yes' }))).toThrow(EnvError);
   });
 });

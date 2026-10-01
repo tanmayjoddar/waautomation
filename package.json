@@ -16,6 +16,8 @@
     "test:watch": "vitest",
     "seed": "tsx scripts/seed.ts",
     "chat": "tsx scripts/chat.ts",
+    "resume": "tsx scripts/resume.ts",
+    "eval": "tsx scripts/eval.ts",
     "env:check": "tsx scripts/check-env-keys.ts",
     "simulate:webhook": "tsx scripts/simulate-webhook.ts"
   },

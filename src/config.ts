@@ -65,17 +65,29 @@ const envSchema = z.object({
   QUIET_HOURS_START: timeString.default('22:00'),
   QUIET_HOURS_END: timeString.default('07:00'),
 
-  // Slice 3 only, removed in Slice 4: temporary "I got: <text>" echo for the
-  // demo client. Strict enum on purpose: ECHO_MODE=yes must NOT silently mean
-  // "send real WhatsApp messages".
-  ECHO_MODE: z.enum(['true', 'false']).optional(),
-
   // live = real Meta sends. console = fake client that prints the would-be
   // reply to stdout (never to the logs) and still saves the out row with a
   // fake wamid, for testing while Meta delivery is unavailable. Console mode
   // is demo-client-only, enforced where clients are resolved (see
   // src/whatsapp/sendMode.ts), never here.
   SEND_MODE: z.enum(['live', 'console']).default('live'),
+
+  // Slice 4 worker + LLM brain. The LLM_* trio stays all-or-none (existing
+  // rule): without it the webhook still runs but the worker does not start.
+  WORKER_ENABLED: z.enum(['true', 'false']).default('true'),
+  WORKER_POLL_MS: z.coerce.number().int().min(100).max(60_000).default(1000),
+  WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(10).default(2),
+  LLM_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120_000).default(20_000),
+  LLM_MAX_OUTPUT_TOKENS: z.coerce.number().int().min(50).max(4000).default(400),
+  RATE_LIMIT_MESSAGES: z.coerce.number().int().min(1).max(1000).default(20),
+  RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().min(10).max(3600).default(60),
+  MAX_LLM_CALLS_PER_CLIENT_PER_DAY: z.coerce.number().int().min(1).default(2000),
+  FALLBACK_COOLDOWN_SECONDS: z.coerce.number().int().min(0).max(86_400).default(600),
+  // Optional $/MTok for usage_log.est_cost. Defaults are gemini-3.8-flash paid
+  // prices through Dec 2026 ($0.75 in / $3.75 out); without them cost is null.
+  // Free-tier tokens cost nothing either way.
+  LLM_PRICE_IN_PER_MTOK: z.coerce.number().positive().optional(),
+  LLM_PRICE_OUT_PER_MTOK: z.coerce.number().positive().optional(),
 
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
 });
@@ -141,11 +153,14 @@ export type AppConfig = {
   meta: { appSecret: string; verifyToken: string; graphApiVersion: string } | null;
   whatsappDemo: { phoneNumberId: string; token: string } | null;
   encryptionKey: Buffer | null;
-  /** Slice 3 only: temporary echo for the demo client. Removed in Slice 4. */
-  echoMode: boolean;
   /** 'live' = real Meta sends; 'console' = fake sends for the demo client only. */
   sendMode: 'live' | 'console';
-  llm: { provider: 'gemini' | 'anthropic' | 'openai' | 'fake'; apiKey: string; model: string } | null;
+  worker: { enabled: boolean; pollMs: number; concurrency: number };
+  rateLimit: { messages: number; windowSeconds: number };
+  dailyLlmCap: number;
+  fallbackCooldownSeconds: number;
+  llmPrices: { inPerMtok: number; outPerMtok: number } | null;
+  llm: { provider: 'gemini' | 'anthropic' | 'openai' | 'fake'; apiKey: string; model: string; timeoutMs: number; maxOutputTokens: number } | null;
   stt: { provider: 'openai-whisper' | 'gemini' | 'google' | 'sarvam' | 'fake'; apiKey: string } | null;
   telegram: { botToken: string; chatId: string } | null;
   sheets: { serviceAccountEmail: string; privateKey: string } | null;
@@ -385,13 +400,22 @@ export function loadEnv(source: RawEnv = process.env): AppConfig {
       ? { phoneNumberId: e.WA_PHONE_NUMBER_ID as string, token: e.WA_TOKEN as string }
       : null,
     encryptionKey,
-    echoMode: e.ECHO_MODE === 'true',
     sendMode: e.SEND_MODE,
+    worker: { enabled: e.WORKER_ENABLED === 'true', pollMs: e.WORKER_POLL_MS, concurrency: e.WORKER_CONCURRENCY },
+    rateLimit: { messages: e.RATE_LIMIT_MESSAGES, windowSeconds: e.RATE_LIMIT_WINDOW_SECONDS },
+    dailyLlmCap: e.MAX_LLM_CALLS_PER_CLIENT_PER_DAY,
+    fallbackCooldownSeconds: e.FALLBACK_COOLDOWN_SECONDS,
+    llmPrices:
+      e.LLM_PRICE_IN_PER_MTOK !== undefined && e.LLM_PRICE_OUT_PER_MTOK !== undefined
+        ? { inPerMtok: e.LLM_PRICE_IN_PER_MTOK, outPerMtok: e.LLM_PRICE_OUT_PER_MTOK }
+        : null,
     llm: features.llm
       ? {
           provider: e.LLM_PROVIDER as 'gemini' | 'anthropic' | 'openai' | 'fake',
           apiKey: e.LLM_API_KEY as string,
           model: e.LLM_MODEL as string,
+          timeoutMs: e.LLM_TIMEOUT_MS,
+          maxOutputTokens: e.LLM_MAX_OUTPUT_TOKENS,
         }
       : null,
     stt: features.stt
