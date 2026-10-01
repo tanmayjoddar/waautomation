@@ -14,6 +14,10 @@
 --   worker queue is global by nature - a worker must be able to pick up any
 --   client's next job. Each row still carries client_id, and every query that
 --   reads or writes tenant data after the claim filters by client_id.
+--   claim_due_job(p_client_id uuid default null) supports both: pass the tenant to
+--   claim one client's queue, or pass nothing (the default) to claim from the
+--   shared global queue. The global path is kept because the worker is a single
+--   process serving every tenant.
 --
 -- CHANGES vs the SQL in the spec, with the reason for each:
 --   1. Idempotent guards (if not exists / drop policy if exists). A human
@@ -29,6 +33,12 @@
 --   6. messages.seq: a monotonic identity column, because created_at alone is
 --      millisecond-resolution and "inbound since the last outbound" (spec 1.8)
 --      needs a total order for a burst of quick-fire messages.
+--   7. Slice 2: messages.media_id, so an inbound voice note keeps the Meta media
+--      id that Slice 5 downloads with the client access token.
+--   8. Slice 2: explicit REVOKE/GRANT at the very end of this file. Postgres
+--      gives EXECUTE on a new function to PUBLIC, and Supabase's anon and
+--      authenticated roles are members of PUBLIC, so without this anyone with
+--      the public anon key could claim other tenants' jobs.
 --   NOT changed, because testing showed they are correct:
 --   - client_stats() with zero bookings in the period (returns exactly one row
 --     of zeros; verified on PostgreSQL 17).
@@ -116,6 +126,10 @@ create table if not exists messages (
   direction text not null check (direction in ('in','out')),
   type text not null,                   -- text | audio | template | interactive | other
   text text,
+  -- Meta's media id for an inbound voice note. The webhook (Slice 2) stores it;
+  -- Slice 5 downloads it from Meta with the client token. NULL for every other
+  -- message type.
+  media_id text,
   transcript text,
   status text,                          -- sent | delivered | read | failed
   created_at timestamptz default now(),
@@ -336,3 +350,30 @@ create policy "tenant_update_bookings" on bookings for update
 
 -- sheet_outbox is server-only: RLS on, no policies = dashboard users cannot read it
 alter table sheet_outbox enable row level security;
+
+-- =============================================================================
+-- Function privileges.
+--
+-- Postgres grants EXECUTE on every new function to PUBLIC, and Supabase's
+-- `anon` and `authenticated` roles are members of PUBLIC. Left alone, the anon
+-- key could call claim_due_job() and enqueue_reply_job(): not a data leak by
+-- itself (RLS still applies to the rows), but it lets anyone with the public
+-- anon key enqueue work or claim other tenants' jobs. So:
+--
+--   claim_due_job, enqueue_reply_job -> service_role only (the server/worker)
+--   client_stats                     -> service_role + authenticated, so the
+--                                       dashboard can read counts for its own
+--                                       clients. It is SECURITY INVOKER, so RLS
+--                                       inside it still limits it to the caller.
+--
+-- This block is last on purpose: re-running the file recreates the functions,
+-- which resets their privileges, so the grants have to be applied afterwards.
+-- =============================================================================
+
+revoke all on function claim_due_job(uuid) from public, anon, authenticated;
+revoke all on function enqueue_reply_job(uuid, uuid, integer) from public, anon, authenticated;
+revoke all on function client_stats(uuid, timestamptz, timestamptz) from public, anon, authenticated;
+
+grant execute on function claim_due_job(uuid) to service_role;
+grant execute on function enqueue_reply_job(uuid, uuid, integer) to service_role;
+grant execute on function client_stats(uuid, timestamptz, timestamptz) to service_role, authenticated;

@@ -15,7 +15,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "seed": "tsx scripts/seed.ts",
-    "env:check": "tsx scripts/check-env-keys.ts"
+    "env:check": "tsx scripts/check-env-keys.ts",
+    "simulate:webhook": "tsx scripts/simulate-webhook.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.117.2",

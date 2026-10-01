@@ -1,21 +1,35 @@
 /**
  * Express app factory.
  *
- * Slice 0 builds only the health endpoint. The webhook route (Slice 2) mounts
- * its own raw body parser, so there is deliberately NO global express.json()
- * here: adding it now would make the raw body unreadable and silently break
- * X-Hub-Signature-256 verification later.
+ * `/healthz` and, from Slice 2, the Meta webhook.
+ *
+ * There is deliberately NO global express.json() here: the webhook signature is
+ * computed over the exact bytes Meta sent, and a JSON body parser would consume
+ * them and make X-Hub-Signature-256 impossible to verify (and impossible to debug
+ * when it fails). The webhook route mounts its own raw parser.
  */
 import express, { type Express } from 'express';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Logger } from 'pino';
 import type { AppConfig } from './config.js';
+import { createWebhookRouter, type WebhookDeps } from './webhook/route.js';
 
 export type AppDeps = {
   config: AppConfig;
   logger: Logger;
+  /**
+   * Needed only by the webhook. A server started without a database (nothing in
+   * this project needs one before Slice 2) can leave it out; the webhook then
+   * answers 503 instead of pretending to work.
+   */
+  supabase?: SupabaseClient;
+  /** Forwarded to the webhook router; used by tests. */
+  hooks?: WebhookDeps['hooks'];
+  /** Replaces the ingest pipeline; used by tests. */
+  ingest?: WebhookDeps['ingest'];
 };
 
-export function createApp({ config, logger }: AppDeps): Express {
+export function createApp({ config, logger, supabase, hooks, ingest }: AppDeps): Express {
   const app = express();
   app.disable('x-powered-by');
 
@@ -27,6 +41,12 @@ export function createApp({ config, logger }: AppDeps): Express {
       features: config.features,
     });
   });
+
+  if (supabase) {
+    app.use(createWebhookRouter({ config, logger, supabase, hooks, ingest }));
+  } else {
+    logger.warn({}, 'no Supabase client: /webhook is not mounted');
+  }
 
   app.use((_req, res) => {
     res.status(404).json({ error: 'not_found' });

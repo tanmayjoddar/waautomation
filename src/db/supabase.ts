@@ -7,7 +7,7 @@
  */
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import type { AppConfig } from '../config.js';
-import type { Client, ClientStats, Contact, Job } from './types.js';
+import type { Client, ClientStats, Contact, Job, Message } from './types.js';
 
 /**
  * Service-role client for the server and for scripts/tests.
@@ -124,4 +124,150 @@ export async function upsertContact(
     .single();
   if (error) throw new Error(`upsertContact failed: ${error.message}`);
   return data as Contact;
+}
+
+/**
+ * findOrCreateContact: like upsertContact, but also reports whether the contact
+ * is new, because the spec only queues a sheet_outbox row for a first contact.
+ *
+ * Two steps instead of one upsert so that `created` is trustworthy. The insert
+ * still uses ignoreDuplicates, so two concurrent deliveries of the same message
+ * cannot turn into a unique-violation crash.
+ */
+export async function findOrCreateContact(
+  supabase: SupabaseClient,
+  clientId: string,
+  phone: string,
+  patch: Partial<Pick<Contact, 'name' | 'last_inbound_at'>> = {},
+): Promise<{ contact: Contact; created: boolean }> {
+  const { data: existing, error: readError } = await supabase
+    .from('contacts')
+    .select('*')
+    .eq('client_id', clientId)
+    .eq('phone', phone)
+    .maybeSingle();
+  if (readError) throw new Error(`findOrCreateContact lookup failed: ${readError.message}`);
+
+  if (existing) {
+    const contact = existing as Contact;
+    const { data, error } = await supabase
+      .from('contacts')
+      .update(patch)
+      .eq('id', contact.id)
+      .eq('client_id', clientId)
+      .select('*')
+      .single();
+    if (error) throw new Error(`findOrCreateContact update failed: ${error.message}`);
+    return { contact: data as Contact, created: false };
+  }
+
+  const { data, error } = await supabase
+    .from('contacts')
+    .insert({ client_id: clientId, phone, ...patch })
+    .select('*')
+    .single();
+  if (!error && data) return { contact: data as Contact, created: true };
+
+  // Lost a race with a concurrent delivery: the row exists, so take the slow path.
+  if (error?.code !== '23505') {
+    throw new Error(`findOrCreateContact insert failed: ${error?.message ?? 'unknown error'}`);
+  }
+  const { data: raced, error: readAgain } = await supabase
+    .from('contacts')
+    .select('*')
+    .eq('client_id', clientId)
+    .eq('phone', phone)
+    .single();
+  if (readAgain) throw new Error(`findOrCreateContact re-read failed: ${readAgain.message}`);
+  return { contact: raced as Contact, created: false };
+}
+
+/** True when this wamid is already stored for this client: a duplicate delivery. */
+export async function messageAlreadyStored(
+  supabase: SupabaseClient,
+  clientId: string,
+  wamid: string,
+): Promise<boolean> {
+  const { data, error } = await supabase
+    .from('messages')
+    .select('id')
+    .eq('client_id', clientId)
+    .eq('wamid', wamid)
+    .limit(1);
+  if (error) throw new Error(`messageAlreadyStored failed: ${error.message}`);
+  return (data ?? []).length > 0;
+}
+
+/**
+ * insertInboundMessage: stores one inbound message.
+ *
+ * Returns null when the row already exists. The unique (client_id, wamid)
+ * constraint is the authority here, not the caller's check, so two concurrent
+ * deliveries of the same message cannot both be stored (spec 1.6 step 4).
+ */
+export async function insertInboundMessage(
+  supabase: SupabaseClient,
+  row: {
+    clientId: string;
+    contactId: string;
+    wamid: string;
+    type: Message['type'];
+    text: string | null;
+    mediaId?: string | null;
+    at: string;
+  },
+): Promise<Message | null> {
+  // ignoreDuplicates turns the unique (client_id, wamid) violation into "no rows
+  // returned" instead of an error, which is exactly the duplicate signal wanted,
+  // and it is atomic: two concurrent deliveries cannot both insert.
+  const { data, error } = await supabase
+    .from('messages')
+    .upsert(
+      {
+        client_id: row.clientId,
+        contact_id: row.contactId,
+        wamid: row.wamid,
+        direction: 'in',
+        type: row.type,
+        text: row.text,
+        media_id: row.mediaId ?? null,
+        created_at: row.at,
+      },
+      { onConflict: 'client_id,wamid', ignoreDuplicates: true },
+    )
+    .select('*')
+    .maybeSingle();
+  if (error) throw new Error(`insertInboundMessage failed: ${error.message}`);
+  return (data as Message | null) ?? null;
+}
+
+/** Updates one message's delivery status. Returns false when the wamid is unknown. */
+export async function updateMessageStatus(
+  supabase: SupabaseClient,
+  clientId: string,
+  wamid: string,
+  status: string,
+): Promise<boolean> {
+  const { data, error } = await supabase
+    .from('messages')
+    .update({ status })
+    .eq('client_id', clientId)
+    .eq('wamid', wamid)
+    .select('id');
+  if (error) throw new Error(`updateMessageStatus failed: ${error.message}`);
+  return (data ?? []).length > 0;
+}
+
+/** Queues a new contact for the client's Google Sheet (Slice 8B drains this). */
+export async function queueSheetContact(
+  supabase: SupabaseClient,
+  clientId: string,
+  contactId: string,
+): Promise<void> {
+  const { error } = await supabase.from('sheet_outbox').insert({
+    client_id: clientId,
+    entity: 'contact',
+    entity_id: contactId,
+  });
+  if (error) throw new Error(`queueSheetContact failed: ${error.message}`);
 }

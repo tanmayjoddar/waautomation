@@ -80,6 +80,8 @@ export type Message = {
   direction: 'in' | 'out';
   type: MessageType;
   text: string | null;
+  /** Meta's media id for audio; Slice 5 downloads it from this. */
+  media_id: string | null;
   transcript: string | null;
   status: string | null;
   created_at: string;
