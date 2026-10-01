@@ -167,6 +167,46 @@ export class EnvError extends Error {
 
 const present = (v: string | undefined): boolean => typeof v === 'string' && v.trim() !== '';
 
+/**
+ * Removes one matching pair of surrounding quotes.
+ *
+ * `parseDotEnv` already does this for values that come from a `.env` file, but a
+ * value can also arrive from the shell, a Docker `-e` flag or a hosting
+ * platform's secret editor, and those often keep the quotes. Google documents
+ * `GOOGLE_PRIVATE_KEY="-----BEGIN ...\n..."` with the quotes, so stripping them
+ * here is what makes that documented form work.
+ */
+const unquote = (v: string): string => {
+  if (v.length >= 2 && v.startsWith('"') && v.endsWith('"')) return v.slice(1, -1);
+  if (v.length >= 2 && v.startsWith("'") && v.endsWith("'")) return v.slice(1, -1);
+  return v;
+};
+
+/**
+ * Normalises a raw env map before validation:
+ *
+ * - unquotes values (see `unquote`);
+ * - turns `KEY=` into "not set".
+ *
+ * The second rule matters a lot in practice: `.env.example` ships every optional
+ * variable with an empty value, so a developer who copies it to `.env` and fills
+ * in only the database keys would otherwise get a dozen "must contain at least 1
+ * character(s)" errors for values they never intended to set. An empty variable
+ * is indistinguishable from an unset one, so it is treated as unset.
+ */
+function normalizeEnv(source: RawEnv): RawEnv {
+  const out: RawEnv = {};
+  for (const [key, raw] of Object.entries(source)) {
+    if (raw === undefined) {
+      out[key] = undefined;
+      continue;
+    }
+    const value = unquote(raw);
+    out[key] = value.trim() === '' ? undefined : value;
+  }
+  return out;
+}
+
 /** Google service account keys arrive with literal "\n" in .env. */
 const unescapeNewlines = (v: string): string => v.replace(/\\n/g, '\n');
 
@@ -194,6 +234,7 @@ function decodeEncryptionKey(raw: string | undefined, problems: string[]): Buffe
  */
 export function loadEnv(source: RawEnv = process.env): AppConfig {
   const problems: string[] = [];
+  const env = normalizeEnv(source);
 
   // 1. feature-group completeness, checked on the raw values so a typo in a
   //    half-filled group is reported before zod's per-field messages.
@@ -208,9 +249,9 @@ export function loadEnv(source: RawEnv = process.env): AppConfig {
   } as Features;
 
   for (const group of FEATURE_GROUPS) {
-    const given = group.keys.filter((k) => present(source[k]));
+    const given = group.keys.filter((k) => present(env[k]));
     if (given.length === 0) continue;
-    const missing = group.keys.filter((k) => !present(source[k]));
+    const missing = group.keys.filter((k) => !present(env[k]));
     if (missing.length > 0) {
       problems.push(
         `${group.label}: ${given.join(', ')} is set, so the whole group is required. Missing: ${missing.join(', ')}`,
@@ -220,8 +261,20 @@ export function loadEnv(source: RawEnv = process.env): AppConfig {
     features[group.key] = true;
   }
 
+  // A pasted PEM block is the single most common Google Sheets setup mistake:
+  // `.env` cannot hold a real multi-line value, so only the first line survives
+  // and Google rejects the key with an opaque error much later. A valid key always
+  // *starts* with `-----BEGIN`, so requiring that also catches a stray quote left
+  // behind by a broken paste.
+  const rawPrivateKey = env.GOOGLE_PRIVATE_KEY;
+  if (present(rawPrivateKey) && !(rawPrivateKey as string).trimStart().startsWith('-----BEGIN')) {
+    problems.push(
+      'GOOGLE_PRIVATE_KEY: does not look like a private key. Put it on ONE line with \\n escapes, e.g. "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"',
+    );
+  }
+
   // 2. field-level validation
-  const parsed = envSchema.safeParse(source);
+  const parsed = envSchema.safeParse(env);
   if (!parsed.success) {
     for (const issue of parsed.error.issues) {
       const name = issue.path.join('.') || '(root)';

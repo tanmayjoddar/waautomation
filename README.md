@@ -32,8 +32,17 @@ Fill in `.env`. Rules enforced by `src/config.ts`:
   `ENCRYPTION_KEY` (`openssl rand -base64 32`).
 - Missing or invalid variables are reported **all at once**, by name, with no
   secret values in the message.
+- A variable left blank (`KEY=`) counts as **not set**, so a copied
+  `.env.example` with only the database keys filled in starts cleanly.
+- `GOOGLE_PRIVATE_KEY` must be on **one line** with `\n` escapes, the form
+  Google documents: `"-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"`.
+  Surrounding quotes are stripped for you, and a key pasted as real newlines is
+  rejected at startup instead of failing later inside the Google client.
 
 **Never commit `.env`, never paste a secret into a chat.** `.env` is git-ignored.
+
+`npm run env:check` prints only `set` / `empty` for every variable, so you can
+confirm what is configured without exposing any value.
 
 ## Commands
 
@@ -42,9 +51,45 @@ Fill in `.env`. Rules enforced by `src/config.ts`:
 | `npm test` | Runs the whole vitest suite (no network, no paid API) |
 | `npm run test:watch` | Same, in watch mode |
 | `npm run typecheck` | `tsc --noEmit` over src + tests + scripts |
+| `npm run env:check` | Prints `set` / `empty` per variable, never a value |
+| `npm run seed` | Creates the demo tenant, its settings and 5 knowledge rows |
 | `npm run dev` | Starts the server with reload (`tsx watch`) |
 | `npm run build` | Compiles TypeScript to `dist/` |
 | `npm start` | Runs the compiled server |
+
+## Database (Slice 1)
+
+The schema is plain SQL, applied **by hand** so nothing can run against your
+production database unnoticed.
+
+1. Supabase dashboard -> **SQL Editor** -> **New query**.
+2. Paste the whole of `supabase/migrations/001_init.sql` and run it. It is
+   idempotent, so re-running it is safe.
+3. Back in this folder:
+
+```bash
+npm run env:check      # confirm SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are set
+npm run seed
+```
+
+The seed prints the demo client's id, name and the number of knowledge rows. It
+is safe to run again: the client is found by `phone_number_id` and the five
+knowledge rows are updated in place, never duplicated.
+
+Requires these variables in `.env`:
+
+| Variable | Where to get it |
+|----------|-----------------|
+| `SUPABASE_URL` | Project Settings -> API -> Project URL |
+| `SUPABASE_SERVICE_ROLE_KEY` | Project Settings -> API -> service_role |
+| `SUPABASE_ANON_KEY` | Project Settings -> API -> anon public key |
+
+`SUPABASE_ANON_KEY` is used **only** by the RLS test, to prove that a logged-out
+caller cannot read another tenant's data. Without it that test is skipped and
+the rest of the suite still runs.
+
+`tests/db/*.test.ts` run against the real database, so they are skipped (with a
+printed reason) until the migration has been applied.
 
 ## Local smoke test
 
@@ -62,7 +107,7 @@ phone numbers are redacted (`919812345678` -> `91********78`).
 | Slice | Build | State |
 |-------|-------|-------|
 | **0** | Scaffold, `config.ts`, `.env.example`, logging, vitest, `.gitignore` | **done** |
-| 1 | Migration SQL, Supabase client, seed script, RLS test | next |
+| **1** | Migration SQL, Supabase client, seed script, RLS test | **code done, awaiting the migration being run in Supabase** |
 | 2 | Webhook GET/POST, signature verification, dedupe, `simulate-webhook.ts` | not started |
 | 3 | WhatsApp client adapter (`sendText`, `markReadAndType`) | not started |
 | 4 | Worker + debounce + LLM adapter + prompt + zod schema | not started |
@@ -86,8 +131,14 @@ phone numbers are redacted (`919812345678` -> `91********78`).
   it has a value.
 - No global body parser is installed: the webhook route (Slice 2) needs the raw
   body for `X-Hub-Signature-256`.
-- Multi-tenancy (`client_id` on every table and query) starts in Slice 1 with
-  the migration and the cross-tenant RLS test.
+- Multi-tenancy starts in Slice 1: `client_id` on every tenant table and on every
+  query in `db/supabase.ts`, plus row-level security policies in the migration and
+  a two-user test that proves one tenant cannot read or write another's rows.
+- `client_stats` and `claim_due_job` are the two functions a worker must call
+  instead of a plain `select`, so a missing tenant scope cannot become a silent
+  data leak. `claim_due_job` claims from the shared queue with `FOR UPDATE SKIP
+  LOCKED`, which is why the job tables are the documented exception to per-tenant
+  querying: every statement after the claim filters by `client_id`.
 
 ## Dependencies (and why)
 
@@ -96,6 +147,7 @@ phone numbers are redacted (`919812345678` -> `91********78`).
 | `express` | HTTP server for the webhook and `/healthz` |
 | `pino` | Fast structured JSON logs with built-in redaction |
 | `zod` | Validates `.env` and (from Slice 4) the AI's JSON output |
+| `@supabase/supabase-js` | Official PostgREST + Auth client: reads/writes rows, calls `rpc()` for the SQL functions, and creates the two test users used by the RLS test |
 | `typescript`, `tsx`, `vitest`, `@types/*` (dev) | Compile, run, and test |
 
 No WhatsApp, LLM, speech or Google client library is installed yet: each one

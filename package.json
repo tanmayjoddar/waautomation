@@ -13,9 +13,12 @@
     "start": "node dist/server.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "seed": "tsx scripts/seed.ts",
+    "env:check": "tsx scripts/check-env-keys.ts"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.117.2",
     "express": "^5.1.0",
     "pino": "^9.5.0",
     "zod": "^3.23.8"
