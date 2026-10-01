@@ -70,6 +70,13 @@ const envSchema = z.object({
   // "send real WhatsApp messages".
   ECHO_MODE: z.enum(['true', 'false']).optional(),
 
+  // live = real Meta sends. console = fake client that prints the would-be
+  // reply to stdout (never to the logs) and still saves the out row with a
+  // fake wamid, for testing while Meta delivery is unavailable. Console mode
+  // is demo-client-only, enforced where clients are resolved (see
+  // src/whatsapp/sendMode.ts), never here.
+  SEND_MODE: z.enum(['live', 'console']).default('live'),
+
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
 });
 
@@ -136,6 +143,8 @@ export type AppConfig = {
   encryptionKey: Buffer | null;
   /** Slice 3 only: temporary echo for the demo client. Removed in Slice 4. */
   echoMode: boolean;
+  /** 'live' = real Meta sends; 'console' = fake sends for the demo client only. */
+  sendMode: 'live' | 'console';
   llm: { provider: 'gemini' | 'anthropic' | 'openai' | 'fake'; apiKey: string; model: string } | null;
   stt: { provider: 'openai-whisper' | 'gemini' | 'google' | 'sarvam' | 'fake'; apiKey: string } | null;
   telegram: { botToken: string; chatId: string } | null;
@@ -377,6 +386,7 @@ export function loadEnv(source: RawEnv = process.env): AppConfig {
       : null,
     encryptionKey,
     echoMode: e.ECHO_MODE === 'true',
+    sendMode: e.SEND_MODE,
     llm: features.llm
       ? {
           provider: e.LLM_PROVIDER as 'gemini' | 'anthropic' | 'openai' | 'fake',

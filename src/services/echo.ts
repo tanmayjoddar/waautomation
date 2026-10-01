@@ -20,7 +20,8 @@ import type { Logger } from 'pino';
 import type { AppConfig } from '../config.js';
 import { findClientByPhoneNumberId, insertOutboundMessage } from '../db/supabase.js';
 import type { MessageType } from '../db/types.js';
-import { createWhatsAppClient, type WhatsAppClient } from '../whatsapp/client.js';
+import type { WhatsAppClient } from '../whatsapp/client.js';
+import { resolveWhatsAppClient } from '../whatsapp/sendMode.js';
 import type { IngestDeps } from '../webhook/ingest.js';
 
 export type EchoDeps = {
@@ -120,11 +121,13 @@ export async function createEchoHooks(args: {
     return undefined;
   }
 
-  const whatsapp = createWhatsAppClient({
-    phoneNumberId: config.whatsappDemo.phoneNumberId,
+  // Live mode sends for real; console mode prints to stdout and saves fake
+  // wamids. Either way the demo-client restriction holds twice: here by id,
+  // and inside the factory by phone_number_id.
+  const whatsapp = resolveWhatsAppClient(config, logger, {
+    clientId: demo.id,
+    phoneNumberId: demo.phone_number_id ?? config.whatsappDemo.phoneNumberId,
     token: config.whatsappDemo.token,
-    graphApiVersion: config.meta.graphApiVersion,
-    logger,
   });
   const deps: EchoDeps = { supabase, whatsapp, logger, demoClientId: demo.id };
   logger.info({ clientId: demo.id }, 'echo enabled for the demo client only (temporary, Slice 4 removes it)');

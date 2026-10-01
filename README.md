@@ -167,6 +167,14 @@ otherwise attempt a real send to an invalid number (logged as failed, harmless,
 but noisy). `tests/whatsapp/fake.ts` (`createFakeWhatsAppClient`) is the fake
 later slices' worker tests will use.
 
+Testing without Meta delivery: `SEND_MODE=live` (default) sends for real;
+`SEND_MODE=console` uses the fake for the **demo client only** (any other
+client is refused with an error). Console replies print to stdout — never to
+the logs — and the out row is still saved with a fake wamid. `npm run chat`
+is the interactive version: type as a fake customer of the demo client, the
+real ingest pipeline answers immediately (debounce skipped), rows live in the
+demo tenant while you chat and are deleted on exit.
+
 ## Local smoke test
 
 ```bash

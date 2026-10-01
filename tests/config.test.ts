@@ -496,3 +496,18 @@ describe('ECHO_MODE (Slice 3 only, removed in Slice 4)', () => {
     expect(() => loadEnv(baseEnv({ ECHO_MODE: '1' }))).toThrow(EnvError);
   });
 });
+
+describe('SEND_MODE', () => {
+  it('defaults to live', () => {
+    expect(loadEnv(baseEnv()).sendMode).toBe('live');
+  });
+
+  it('accepts console', () => {
+    expect(loadEnv(baseEnv({ SEND_MODE: 'console' })).sendMode).toBe('console');
+  });
+
+  it('rejects anything else', () => {
+    expect(() => loadEnv(baseEnv({ SEND_MODE: 'off' }))).toThrow(EnvError);
+    expect(() => loadEnv(baseEnv({ SEND_MODE: 'CONSOLE' }))).toThrow(EnvError);
+  });
+});
