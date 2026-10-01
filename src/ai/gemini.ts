@@ -19,8 +19,14 @@
  * Deliberately NOT sent: thinking-budget fields (a wrong field 400s every
  * call; the default applies) and temperature (provider default applies).
  */
-import type { Logger } from 'pino';
-import { LlmError, postJsonWithRetry, type GenerateInput, type GenerateResult, type LlmAdapter } from './llm.js';
+import type { Logger } from "pino";
+import {
+  LlmError,
+  postJsonWithRetry,
+  type GenerateInput,
+  type GenerateResult,
+  type LlmAdapter,
+} from "./llm.js";
 
 export type GeminiOptions = {
   apiKey: string;
@@ -30,41 +36,84 @@ export type GeminiOptions = {
   baseDelayMs?: number;
 };
 
-const textOf = (value: unknown): string | null => (typeof value === 'string' ? value : null);
+const textOf = (value: unknown): string | null =>
+  typeof value === "string" ? value : null;
 
 export function createGeminiAdapter(options: GeminiOptions): LlmAdapter {
   return {
-    provider: 'gemini',
+    provider: "gemini",
     async generate(input: GenerateInput): Promise<GenerateResult> {
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${options.model}:generateContent`;
       const contents = [
-        ...input.history.map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.text }] })),
-        { role: 'user', parts: [{ text: input.userText }] },
+        ...input.history.map((m) => ({
+          role: m.role === "assistant" ? "model" : "user",
+          parts: [{ text: m.text }],
+        })),
+        { role: "user", parts: [{ text: input.userText }] },
       ];
       const parsed = (await postJsonWithRetry(
         url,
-        { 'x-goog-api-key': options.apiKey },
+        { "x-goog-api-key": options.apiKey },
         {
           system_instruction: { parts: [{ text: input.system }] },
           contents,
-          generationConfig: { responseMimeType: 'application/json', maxOutputTokens: input.maxTokens },
+          generationConfig: {
+            responseMimeType: "application/json",
+            maxOutputTokens: input.maxTokens,
+          },
         },
-        { timeoutMs: input.timeoutMs, fetchImpl: options.fetchImpl, logger: options.logger, baseDelayMs: options.baseDelayMs, op: 'llm.gemini.generate' },
+        {
+          timeoutMs: input.timeoutMs,
+          fetchImpl: options.fetchImpl,
+          logger: options.logger,
+          baseDelayMs: options.baseDelayMs,
+          op: "llm.gemini.generate",
+        },
       )) as {
-        candidates?: Array<{ content?: { parts?: Array<{ text?: unknown }> } }>;
-        usageMetadata?: { promptTokenCount?: unknown; candidatesTokenCount?: unknown };
+        candidates?: Array<{
+          finishReason?: unknown;
+          content?: { parts?: Array<{ text?: unknown; thought?: unknown }> };
+        }>;
+        usageMetadata?: {
+          promptTokenCount?: unknown;
+          candidatesTokenCount?: unknown;
+          thoughtsTokenCount?: unknown;
+        };
       };
 
-      const parts = parsed?.candidates?.[0]?.content?.parts ?? [];
-      const text = parts.map((p) => textOf(p?.text)).filter((t): t is string => t !== null).join('');
-      if (text === '') {
-        throw new LlmError('llm.gemini.generate: empty response (blocked or no candidates)', 200, null, false);
+      const candidate = parsed?.candidates?.[0];
+      const parts = candidate?.content?.parts ?? [];
+      const text = parts
+        .filter((p) => p?.thought !== true)
+        .map((p) => textOf(p?.text))
+        .filter((t): t is string => t !== null)
+        .join("");
+      if (text === "") {
+        throw new LlmError(
+          "llm.gemini.generate: empty response (blocked or no candidates)",
+          200,
+          null,
+          false,
+        );
+      }
+      if (candidate?.finishReason === "MAX_TOKENS") {
+        options.logger?.warn(
+          {
+            op: "llm.gemini.generate",
+            model: options.model,
+            maxTokens: input.maxTokens,
+          },
+          "llm.gemini.generate: output cut off at the token limit",
+        );
       }
       const usage = parsed?.usageMetadata ?? {};
+      const num = (v: unknown): number => (typeof v === "number" ? v : 0);
       return {
         text,
-        inputTokens: typeof usage.promptTokenCount === 'number' ? usage.promptTokenCount : 0,
-        outputTokens: typeof usage.candidatesTokenCount === 'number' ? usage.candidatesTokenCount : 0,
+        inputTokens: num(usage.promptTokenCount),
+        // Thinking tokens are billed as output, so count them.
+        outputTokens:
+          num(usage.candidatesTokenCount) + num(usage.thoughtsTokenCount),
       };
     },
   };

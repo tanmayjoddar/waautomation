@@ -12,13 +12,24 @@
  * The worker never logs prompts, replies, keys or phone numbers: the pipeline
  * owns all content, and this loop logs ids and counts only.
  */
-import type { SupabaseClient } from '@supabase/supabase-js';
-import type { Logger } from 'pino';
-import type { AppConfig } from '../config.js';
-import { claimDueJob, failJob, markJobDone, requeueStaleJobs } from '../db/supabase.js';
-import type { Job } from '../db/types.js';
-import type { LlmAdapter } from '../ai/llm.js';
-import { consoleNotifier, runReplyJob, type PipelineDeps, type StaffNotifier } from './pipeline.js';
+import type { SupabaseClient } from "@supabase/supabase-js";
+import type { Logger } from "pino";
+import type { AppConfig } from "../config.js";
+import {
+  claimDueJob,
+  failJob,
+  markJobDone,
+  requeueStaleJobs,
+} from "../db/supabase.js";
+import type { Job } from "../db/types.js";
+import type { LlmAdapter } from "../ai/llm.js";
+import { createFallbackLlmAdapter } from "../ai/index.js";
+import {
+  consoleNotifier,
+  runReplyJob,
+  type PipelineDeps,
+  type StaffNotifier,
+} from "./pipeline.js";
 
 export type WorkerDeps = {
   supabase: SupabaseClient;
@@ -39,16 +50,23 @@ const REQUEUE_EVERY_MS = 60_000;
 const STALE_MINUTES = 5;
 const STOP_TIMEOUT_MS = 15_000;
 
-const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Builds the pipeline deps for one job run. Exported for tests and scripts. */
-export function pipelineDepsFor(deps: WorkerDeps): Omit<PipelineDeps, 'config'> & { config: AppConfig } {
+export function pipelineDepsFor(
+  deps: WorkerDeps,
+): Omit<PipelineDeps, "config"> & { config: AppConfig } {
   const llmConfig = deps.config.llm;
-  if (llmConfig === null) throw new Error('worker needs LLM config (LLM_PROVIDER, LLM_API_KEY, LLM_MODEL)');
+  if (llmConfig === null)
+    throw new Error(
+      "worker needs LLM config (LLM_PROVIDER, LLM_API_KEY, LLM_MODEL)",
+    );
   return {
     supabase: deps.supabase,
     logger: deps.logger,
     llm: deps.llm,
+    fallbackLlm: createFallbackLlmAdapter(llmConfig, deps.logger) ?? undefined,
     llmConfig,
     config: deps.config,
     notifier: deps.notifier ?? consoleNotifier(deps.logger),
@@ -60,26 +78,40 @@ export function pipelineDepsFor(deps: WorkerDeps): Omit<PipelineDeps, 'config'> 
 /**
  * Runs one claimed job and records the outcome: done on success, back to
  * pending with backoff (or failed when attempts are exhausted) on error.
- * Shared by the poll loop and by scripts/chat.ts so both settle jobs
- * identically.
+ * Returns the outcome for callers that report it (scripts/chat.ts); the poll
+ * loop logs its own lines. Shared by the poll loop and scripts so both settle
+ * jobs identically.
  */
 export async function settleJob(
   supabase: SupabaseClient,
   logger: Logger,
-  pipeline: Omit<PipelineDeps, 'config'> & { config: AppConfig },
+  pipeline: Omit<PipelineDeps, "config"> & { config: AppConfig },
   job: Job,
-): Promise<void> {
+): Promise<{
+  outcome: "done" | "retried" | "failed";
+  error?: string;
+  fallback?: string | null;
+}> {
   try {
-    await runReplyJob(pipeline, job);
+    const { fallback } = await runReplyJob(pipeline, job);
     await markJobDone(supabase, job.id);
-    logger.info({ jobId: job.id, clientId: job.client_id }, 'reply job done');
+    logger.info({ jobId: job.id, clientId: job.client_id }, "reply job done");
+    return { outcome: "done", fallback };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     try {
       const outcome = await failJob(supabase, job, message);
-      logger.warn({ jobId: job.id, clientId: job.client_id, outcome }, `reply job ${outcome}`);
+      logger.warn(
+        { jobId: job.id, clientId: job.client_id, outcome },
+        `reply job ${outcome}`,
+      );
+      return { outcome, error: message };
     } catch (dbErr) {
-      logger.error({ err: dbErr, jobId: job.id }, 'could not record the job failure');
+      logger.error(
+        { err: dbErr, jobId: job.id },
+        "could not record the job failure",
+      );
+      return { outcome: "failed", error: message };
     }
   }
 }
@@ -101,7 +133,7 @@ export function startWorker(deps: WorkerDeps): WorkerHandle {
         if (Date.now() - lastRequeue >= REQUEUE_EVERY_MS) {
           lastRequeue = Date.now();
           const moved = await requeueStaleJobs(supabase, STALE_MINUTES);
-          if (moved > 0) logger.info({ moved }, 'stale jobs requeued');
+          if (moved > 0) logger.info({ moved }, "stale jobs requeued");
         }
         while (claiming && inFlight.size < config.worker.concurrency) {
           const job = await claimDueJob(supabase, null);
@@ -112,25 +144,31 @@ export function startWorker(deps: WorkerDeps): WorkerHandle {
           inFlight.add(task);
         }
       } catch (err) {
-        logger.error({ err }, 'worker poll failed');
+        logger.error({ err }, "worker poll failed");
       }
       await sleep(config.worker.pollMs);
     }
   };
 
   void loop().catch((err: unknown) => {
-    logger.error({ err }, 'worker loop crashed');
+    logger.error({ err }, "worker loop crashed");
   });
 
   return {
     async stop(): Promise<void> {
       claiming = false;
       if (inFlight.size === 0) return;
-      logger.info({ inFlight: inFlight.size }, 'worker stopping: waiting for in-flight jobs');
+      logger.info(
+        { inFlight: inFlight.size },
+        "worker stopping: waiting for in-flight jobs",
+      );
       await Promise.race([
         Promise.allSettled([...inFlight]),
         sleep(STOP_TIMEOUT_MS).then(() => {
-          logger.warn({ inFlight: inFlight.size }, 'worker stop timed out: leaving jobs running');
+          logger.warn(
+            { inFlight: inFlight.size },
+            "worker stop timed out: leaving jobs running",
+          );
         }),
       ]);
     },

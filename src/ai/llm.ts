@@ -87,7 +87,7 @@ function retryAfterMs(value: string | null): number | null {
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Initial try + 2 retries. */
-const MAX_ATTEMPTS = 3;
+const MAX_ATTEMPTS = 4;
 
 /** Best effort at a provider error body; never throws, never includes content. */
 function readErrorBody(status: number, text: string): { code: string | number | null; message: string } {
@@ -131,7 +131,7 @@ export async function postJsonWithRetry(
   options: HttpOptions,
 ): Promise<unknown> {
   const fetchImpl = options.fetchImpl ?? fetch;
-  const baseDelay = options.baseDelayMs ?? 500;
+  const baseDelay = options.baseDelayMs ?? 1000;
   const op = options.op ?? 'llm.generate';
   let attempt = 0;
 

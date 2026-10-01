@@ -190,7 +190,7 @@ describe('retry policy (provider-independent, exercised on gemini)', () => {
     const error = await mk(fetchImpl).generate(input()).catch((err: unknown) => err);
     expect(error).toBeInstanceOf(LlmError);
     expect((error as LlmError).status).toBe(500);
-    expect(calls).toHaveLength(3);
+    expect(calls).toHaveLength(4);
   });
 
   it('retries a network error, then succeeds', async () => {
