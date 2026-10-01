@@ -223,7 +223,7 @@ describe('parseWebhookPayload: statuses', () => {
   it('reads a delivered status', () => {
     const result = parseWebhookPayload(payload([], { statuses: [status()] }));
     expect(result.changes[0]?.statuses).toEqual([
-      { wamid: 'wamid.OUT1', status: 'delivered', at: '2023-11-14T22:13:25.000Z', errorCode: null, errorTitle: null },
+      { wamid: 'wamid.OUT1', status: 'delivered', at: '2023-11-14T22:13:25.000Z', errorCode: null, errorTitle: null, errorMessage: null },
     ]);
   });
 
@@ -234,23 +234,24 @@ describe('parseWebhookPayload: statuses', () => {
 
   it('keeps the error code and title of a failed status', () => {
     const result = parseWebhookPayload(payload([], { statuses: [status({ status: 'failed', errors: [{ code: 131047, error_data: { details: 'Re-engagement message' }, title: 'Re-engagement message' }] })] }));
-    expect(result.changes[0]?.statuses[0]).toMatchObject({ status: 'failed', errorCode: 131047, errorTitle: 'Re-engagement message' });
+    expect(result.changes[0]?.statuses[0]).toMatchObject({ status: 'failed', errorCode: 131047, errorTitle: 'Re-engagement message', errorMessage: 'Re-engagement message' });
   });
 
-  it('falls back to error_data.details when there is no title', () => {
+  it('keeps error_data.details as the message when there is no title', () => {
     const result = parseWebhookPayload(payload([], { statuses: [status({ status: 'failed', errors: [{ code: 131047, error_data: { details: 'Rate limit hit' } }] })] }));
-    expect(result.changes[0]?.statuses[0]).toMatchObject({ errorCode: 131047, errorTitle: 'Rate limit hit' });
+    expect(result.changes[0]?.statuses[0]).toMatchObject({ errorCode: 131047, errorTitle: null, errorMessage: 'Rate limit hit' });
   });
 
   it('reads a status whose error entry has no code', () => {
     const result = parseWebhookPayload(payload([], { statuses: [status({ status: 'failed', errors: [{ title: 'Something' }] })] }));
-    expect(result.changes[0]?.statuses[0]).toMatchObject({ errorCode: null, errorTitle: 'Something' });
+    expect(result.changes[0]?.statuses[0]).toMatchObject({ errorCode: null, errorTitle: 'Something', errorMessage: null });
   });
 
   it('a status with no error code has null fields, not undefined', () => {
     const result = parseWebhookPayload(payload([], { statuses: [status()] }));
     expect(result.changes[0]?.statuses[0]?.errorCode).toBeNull();
     expect(result.changes[0]?.statuses[0]?.errorTitle).toBeNull();
+    expect(result.changes[0]?.statuses[0]?.errorMessage).toBeNull();
   });
 
   it('drops a status with no id', () => {

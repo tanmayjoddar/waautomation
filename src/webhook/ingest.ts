@@ -123,26 +123,46 @@ const toStoredText = (message: NormalizedMessage): string | null => {
 async function handleStatus(
   deps: IngestDeps,
   clientId: string,
-  status: { wamid: string; status: string; errorCode: number | null; errorTitle: string | null },
+  status: { wamid: string; status: string; errorCode: number | null; errorTitle: string | null; errorMessage: string | null },
   summary: IngestSummary,
 ): Promise<void> {
   const applied = await updateMessageStatus(deps.supabase, clientId, status.wamid, status.status);
   if (!applied) {
-    // Normal for a status for a message sent before the retention window, or for
-    // a message we never stored. Logged with the wamid only.
+    // Unknown wamids are INFO, not debug: a failed status for a message we
+    // never stored (sent before the retention window, or sent by hand while
+    // debugging) is the ONLY trace of why an outbound message never arrived,
+    // so it must be visible at the default log level. Nothing
+    // customer-identifying here: the wamid is Meta's id, not a phone number.
     summary.statusesUnknown += 1;
-    deps.logger.debug({ clientId, wamid: status.wamid, status: status.status }, 'status for an unknown wamid');
+    deps.logger.info(
+      {
+        clientId,
+        wamid: status.wamid,
+        status: status.status,
+        known: false,
+        errorCode: status.errorCode,
+        errorTitle: status.errorTitle,
+        errorMessage: status.errorMessage,
+      },
+      'status for an unknown wamid',
+    );
     return;
   }
   summary.statusesApplied += 1;
-  if (status.errorCode !== null) {
-    deps.logger.warn(
-      { clientId, wamid: status.wamid, status: status.status, errorCode: status.errorCode, errorTitle: status.errorTitle },
-      'message delivery failed',
-    );
-  } else {
-    deps.logger.debug({ clientId, wamid: status.wamid, status: status.status }, 'message status updated');
-  }
+  // Every status event is one info line: 'delivered' proves the phone got it,
+  // 'failed' carries Meta's reason (code + title + message). The nulls on a
+  // clean delivery keep the shape constant so log queries do not branch.
+  deps.logger.info(
+    {
+      clientId,
+      wamid: status.wamid,
+      status: status.status,
+      errorCode: status.errorCode,
+      errorTitle: status.errorTitle,
+      errorMessage: status.errorMessage,
+    },
+    status.errorCode !== null ? 'message delivery failed' : 'message status updated',
+  );
 }
 
 async function handleMessage(
@@ -257,6 +277,10 @@ async function handleChange(deps: IngestDeps, change: NormalizedChange, summary:
     deps.logger.info({ clientId }, 'client is inactive: webhook ignored');
     return;
   }
+  // The match, stated plainly at info: together with the 'unknown
+  // phone_number_id' warning below, every delivery's routing is visible
+  // without opening the database. The id is the business's own number id.
+  deps.logger.info({ phoneNumberId: change.phoneNumberId, clientId }, 'webhook change routed');
 
   for (const error of change.errors) {
     summary.errors += 1;

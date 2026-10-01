@@ -78,6 +78,13 @@ describe.skipIf(!ready.ok)(suiteName, () => {
     return (data ?? []) as Message[];
   };
 
+  /** Structured log records, so tests can assert levels and fields, not substrings. */
+  const logRecords = (): Array<Record<string, unknown>> =>
+    logs()
+      .split('\n')
+      .filter((l) => l.trim() !== '')
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+
   const countJobs = async (client = clientId): Promise<number> => {
     const { count, error } = await h.supabase.from('jobs').select('id', { count: 'exact', head: true }).eq('client_id', client);
     expect(error, 'cannot count jobs').toBeNull();
@@ -351,6 +358,42 @@ describe.skipIf(!ready.ok)(suiteName, () => {
       expect((await messages()).find((m) => m.wamid === wamid)?.status).toBe('failed');
       expect(logs()).toContain('delivery failed');
       expect(logs()).toContain('131047');
+      // One info line with the whole reason: code + title + message.
+      const record = logRecords().find((r) => r['msg'] === 'message delivery failed' && r['wamid'] === wamid);
+      expect(record, 'no failed-status line was logged').toBeDefined();
+      expect(record).toMatchObject({
+        level: 'info',
+        status: 'failed',
+        errorCode: 131047,
+        errorTitle: 'Re-engagement message',
+        errorMessage: 'Re-engagement',
+      });
+    }));
+
+    it('a failed status for an unknown wamid is still logged at info with Meta reason', test(async () => {
+      // The user's case: a message sent by hand (curl/template) has no row, so
+      // its status can never be "applied" - but the reason must still be visible.
+      const unknownWamid = `wamid.UNKNOWN.FAIL.${h.tag}`;
+      const summary = await run(
+        payload(`${h.tag}-main`, {
+          statuses: [{ id: unknownWamid, status: 'failed', timestamp: String(Math.floor(Date.now() / 1000)), errors: [{ code: 131026, error_data: { details: 'This number is not on WhatsApp' }, title: 'Message undeliverable' }] }],
+        }),
+      );
+      expect(summary.statusesUnknown).toBe(1);
+      expect(summary.statusesApplied).toBe(0);
+      const record = logRecords().find((r) => r['msg'] === 'status for an unknown wamid' && r['wamid'] === unknownWamid);
+      expect(record, 'no unknown-wamid status line was logged').toBeDefined();
+      expect(record).toMatchObject({
+        level: 'info',
+        status: 'failed',
+        errorCode: 131026,
+        errorTitle: 'Message undeliverable',
+        errorMessage: 'This number is not on WhatsApp',
+      });
+      // And the routing that led here is stated too: this id matched a client.
+      const routed = logRecords().find((r) => r['msg'] === 'webhook change routed' && r['phoneNumberId'] === `${h.tag}-main`);
+      expect(routed, 'no routing line was logged').toBeDefined();
+      expect(routed?.['level']).toBe('info');
     }));
 
     it('a status for another tenant is never touched', test(async () => {

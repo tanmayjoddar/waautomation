@@ -49,8 +49,13 @@ export async function handleStoredMessageForEcho(
 
   if (info.type !== 'text' || info.text === null || info.text === '') {
     // Text only: the polite "I can read text and voice notes" reply for other
-    // types belongs to Slice 4+, not to this temporary echo.
-    return 'skipped:not-text';
+    // types belongs to Slice 4+, not to this temporary echo. Warned, not
+    // debug-logged: a silent skip here looks exactly like a broken send from
+    // the server window, which is how this was found. No phone, no text, no
+    // name in the line: the type and the reason are all it carries.
+    const reason = info.type !== 'text' ? 'not-text' : 'empty-text';
+    logger.warn({ reason, type: info.type, clientId: info.clientId, wamid: info.wamid }, 'echo skipped');
+    return `skipped:${reason}`;
   }
   if (info.clientId !== demoClientId) {
     // Must never happen (the hook is only wired for the demo tenant), but a

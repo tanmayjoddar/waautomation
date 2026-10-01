@@ -222,6 +222,98 @@ describe('POST /webhook', () => {
       expect(log).not.toContain(APP_SECRET.length > 0 ? signPayload(body, APP_SECRET).slice(7, 27) : 'x');
     });
   });
+
+  describe('webhook visibility', () => {
+    // The shared server above logs at 'silent', so these tests run their own
+    // app with a recording logger: every accepted POST must leave exactly one
+    // info line with counts, and that line must carry no customer data.
+    let visServer: Server;
+    let visBase = '';
+    let visIngest: WebhookDeps['ingest'];
+    const vis = collectingStream();
+
+    const records = (): Array<Record<string, unknown>> =>
+      vis
+        .text()
+        .split('\n')
+        .filter((l) => l.trim() !== '')
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+
+    beforeAll(async () => {
+      const config = loadEnv(metaEnv());
+      const app = createApp({
+        config,
+        logger: createLogger({ level: 'debug', destination: vis.stream }),
+        supabase,
+        ingest: async (...args) => (visIngest ?? (async () => undefined))(...args),
+      });
+      visServer = await new Promise<Server>((resolve) => {
+        const s = app.listen(0, '127.0.0.1', () => resolve(s));
+      });
+      const { port } = visServer.address() as AddressInfo;
+      visBase = `http://127.0.0.1:${port}`;
+    });
+
+    afterAll(async () => {
+      await drainBackgroundWork();
+      await new Promise<void>((resolve) => visServer.close(() => resolve()));
+    });
+
+    const visPost = (raw: string, headers: Record<string, string> = {}): Promise<Response> =>
+      fetch(`${visBase}${PATH}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...headers },
+        body: raw,
+      });
+
+    it('logs every accepted POST at info with message/status counts and the business number id', async () => {
+      visIngest = vi.fn(async () => undefined);
+      const phone = '919000000001';
+      const text = 'VISIBILITY_CANARY_TEXT_987';
+      const raw = JSON.stringify({
+        object: 'whatsapp_business_account',
+        entry: [
+          {
+            id: 'WABA-VIS',
+            changes: [
+              {
+                field: 'messages',
+                value: {
+                  messaging_product: 'whatsapp',
+                  metadata: { display_phone_number: '15550000000', phone_number_id: 'PN-VIS' },
+                  messages: [{ from: phone, id: 'wamid.VIS.1', timestamp: '1', type: 'text', text: { body: text } }],
+                  statuses: [{ id: 'wamid.VIS.OUT.1', status: 'delivered', timestamp: '1' }],
+                },
+              },
+            ],
+          },
+        ],
+      });
+
+      const res = await visPost(raw, signed(raw));
+      expect(res.status).toBe(200);
+      await drainBackgroundWork();
+
+      const receipt = records().find((r) => r['msg'] === 'webhook POST received');
+      expect(receipt, 'no receipt line was logged').toBeDefined();
+      expect(receipt).toMatchObject({ level: 'info', messages: 1, statuses: 1, phoneNumberIds: ['PN-VIS'] });
+      // The receipt carries counts and the business id only: no customer data.
+      const out = vis.text();
+      expect(out).not.toContain(phone);
+      expect(out).not.toContain(text);
+    });
+
+    it('answers 200 for a signed body that is not JSON, warns, and schedules no work', async () => {
+      visIngest = vi.fn(async () => undefined);
+      const res = await visPost('{not json', signed('{not json'));
+      expect(res.status).toBe(200);
+      await drainBackgroundWork();
+      expect(visIngest).not.toHaveBeenCalled();
+      const warn = records().find((r) => typeof r['msg'] === 'string' && (r['msg'] as string).includes('not valid JSON'));
+      expect(warn, 'no invalid-JSON warning was logged').toBeDefined();
+      expect(warn?.['level']).toBe('warn');
+    });
+  });
 });
 
 describe('GET /webhook', () => {

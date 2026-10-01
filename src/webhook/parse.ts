@@ -61,7 +61,10 @@ export type NormalizedStatus = {
   status: string;
   at: string;
   errorCode: number | null;
+  /** errors[0].title, e.g. "Message undeliverable". Null when Meta sent none. */
   errorTitle: string | null;
+  /** errors[0].error_data.details: Meta's human sentence about the failure. */
+  errorMessage: string | null;
 };
 
 export type NormalizedChange = {
@@ -155,12 +158,17 @@ const normalizeStatus = (raw: Json): NormalizedStatus | null => {
   const errors = asArray(raw.errors);
   const error = isRecord(errors[0]) ? errors[0] : undefined;
   const code = error !== undefined && typeof error.code === 'number' ? error.code : null;
+  // Title and message stay separate fields: the code tells automation what
+  // happened, the title names it, and details explains it to the human reading
+  // the log. They were merged once; splitting them is what makes a delivery
+  // failure diagnosable from one log line.
   return {
     wamid,
     status,
     at: unixSecondsToIso(raw.timestamp) ?? new Date(0).toISOString(),
     errorCode: code,
-    errorTitle: error !== undefined ? asString(error.title) ?? asString(asRecord(error.error_data).details) : null,
+    errorTitle: error !== undefined ? asString(error.title) : null,
+    errorMessage: error !== undefined ? asString(asRecord(error.error_data).details) : null,
   };
 };
 
