@@ -41,7 +41,7 @@ export type StoredMessageInfo = {
   text: string | null;
 };
 
-/** 'sent' | 'skipped:<reason>' | 'failed'. Never throws. */
+/** 'sent' | 'skipped:<reason>' | 'failed-send' | 'sent-not-saved'. Never throws. */
 export async function handleStoredMessageForEcho(
   deps: EchoDeps,
   info: StoredMessageInfo,
@@ -65,16 +65,25 @@ export async function handleStoredMessageForEcho(
     return 'skipped:not-demo-client';
   }
 
+  // Spec 1.6: "typing..." first. A failure here must not stop the reply, so
+  // it is caught separately from the send below.
   try {
-    // Spec 1.6: "typing..." first. A failure here must not stop the reply, so
-    // it is caught separately from the send below.
-    try {
-      await whatsapp.markReadAndType(info.wamid);
-    } catch (err) {
-      logger.warn({ err, wamid: info.wamid }, 'echo typing indicator failed, sending anyway');
-    }
+    await whatsapp.markReadAndType(info.wamid);
+  } catch (err) {
+    logger.warn({ err, wamid: info.wamid }, 'echo typing indicator failed, sending anyway');
+  }
 
-    const { wamid } = await whatsapp.sendText(info.contactPhone, `I got: ${info.text}`);
+  // Send and save are separate try blocks on purpose: a sent reply with a
+  // failed save is NOT a failed reply (the customer has it), so the two
+  // failures get different messages and different statuses.
+  let wamid: string;
+  try {
+    ({ wamid } = await whatsapp.sendText(info.contactPhone, `I got: ${info.text}`));
+  } catch (err) {
+    logger.error({ err, clientId: info.clientId, contactId: info.contactId }, 'echo reply failed');
+    return 'failed-send';
+  }
+  try {
     await insertOutboundMessage(supabase, {
       clientId: info.clientId,
       contactId: info.contactId,
@@ -82,13 +91,20 @@ export async function handleStoredMessageForEcho(
       type: 'text',
       text: `I got: ${info.text}`,
     });
-    // No phone, no message text in the log: wamids and ids only.
-    logger.info({ clientId: info.clientId, contactId: info.contactId, wamid }, 'echo reply sent');
-    return 'sent';
   } catch (err) {
-    logger.error({ err, clientId: info.clientId, contactId: info.contactId }, 'echo reply failed');
-    return 'failed';
+    // The customer HAS the reply; only our record of it is missing (e.g. a
+    // wamid collision with rows from an earlier run). Reporting this as a
+    // failed reply would send the next debugging session to Meta instead of
+    // the database, so it gets its own message and status.
+    logger.error(
+      { err, clientId: info.clientId, contactId: info.contactId, wamid },
+      'echo reply sent but the out row was not saved',
+    );
+    return 'sent-not-saved';
   }
+  // No phone, no message text in the log: wamids and ids only.
+  logger.info({ clientId: info.clientId, contactId: info.contactId, wamid }, 'echo reply sent');
+  return 'sent';
 }
 
 /**

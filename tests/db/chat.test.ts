@@ -60,18 +60,22 @@ describe.skipIf(!ready.ok)(suiteName, () => {
     await purgeAbandonedTestTenants(h.supabase, NAMESPACE);
   });
 
-  const chat = (text: string, out: { write(chunk: string): void }): Promise<{ replies: string[]; stored: number; jobs: number }> =>
+  const chat = (
+    text: string,
+    out: { write(chunk: string): void },
+    contactPhone: string = phone,
+  ): Promise<{ replies: string[]; stored: number; jobs: number; errors: number }> =>
     chatOnce(
       {
         supabase: h.supabase,
         logger: createLogger({ level: 'debug', destination: stream }),
         demoClientId: clientId,
         demoPhoneNumberId: phoneNumberId,
-        contactPhone: phone,
+        contactPhone,
         out,
       },
       text,
-    ).then(({ summary, replies }) => ({ replies, stored: summary.stored, jobs: summary.jobsEnqueued }));
+    ).then(({ summary, replies }) => ({ replies, stored: summary.stored, jobs: summary.jobsEnqueued, errors: summary.errors }));
 
   const outRows = async (): Promise<Message[]> => {
     const { data, error } = await h.supabase.from('messages').select('*').eq('client_id', clientId).eq('direction', 'out');
@@ -89,7 +93,7 @@ describe.skipIf(!ready.ok)(suiteName, () => {
 
     const rows = await outRows();
     expect(rows).toHaveLength(1);
-    expect(rows[0]?.wamid).toMatch(/^wamid\.FAKE\.\d+$/);
+    expect(rows[0]?.wamid).toMatch(/^wamid\.FAKE\./);
     expect(rows[0]?.text).toBe('I got: hello bot');
 
     // The printed reply carries the body but no phone number.
@@ -103,16 +107,63 @@ describe.skipIf(!ready.ok)(suiteName, () => {
     expect(replies).toEqual(['I got: second message']);
   }));
 
+  it('survives a restart: rows from an earlier run never collide', test(async () => {
+    // The reported bug: the fake counter restarted at wamid.FAKE.1 on every
+    // server start while out rows persisted, so the first send after a restart
+    // died on the unique (client_id, wamid) constraint and the echo logged
+    // "echo reply failed". Simulate that past: a contact holding an old-format
+    // fake wamid, then a turn with a brand-new fake client. Own phone, so this
+    // test is independent of the other tests' contact.
+    const restartPhone = testPhone(h.tag, 32);
+    const { data: contact, error: contactError } = await h.supabase
+      .from('contacts')
+      .insert({ client_id: clientId, phone: restartPhone })
+      .select('id')
+      .single();
+    expect(contactError, 'cannot create the restart contact').toBeNull();
+    const { error: rowError } = await h.supabase.from('messages').insert({
+      client_id: clientId,
+      contact_id: (contact as { id: string }).id,
+      wamid: 'wamid.FAKE.1',
+      direction: 'out',
+      type: 'text',
+      text: 'I got: from the previous run',
+    });
+    expect(rowError, 'cannot seed the legacy fake row').toBeNull();
+
+    const { replies, stored, errors } = await chat('after restart', { write: () => undefined }, restartPhone);
+
+    expect(stored).toBe(1);
+    expect(errors).toBe(0);
+    expect(replies).toEqual(['I got: after restart']);
+    // Scoped to this test's contact: earlier tests wrote out rows too.
+    const { data: ownRows, error: ownError } = await h.supabase
+      .from('messages')
+      .select('wamid')
+      .eq('client_id', clientId)
+      .eq('contact_id', (contact as { id: string }).id)
+      .eq('direction', 'out')
+      .order('created_at');
+    expect(ownError, 'cannot read own out rows').toBeNull();
+    expect((ownRows ?? []).map((r) => r.wamid as string)).toEqual(['wamid.FAKE.1', expect.stringMatching(/^wamid\.FAKE\./)]);
+    expect(logs()).not.toContain('duplicate key');
+    expect(logs()).not.toContain('out row was not saved');
+  }));
+
   it('cleanup removes the chat contact, its rows and its sheet orphans', test(async () => {
     await chat('to be cleaned', { write: () => undefined });
     const before = await outRows();
     expect(before.length).toBeGreaterThan(0);
+    // This test's contact id, captured before cleanup deletes it: the final
+    // assertion must be scoped to it, because other tests share this client.
+    const { data: mine } = await h.supabase.from('contacts').select('id').eq('client_id', clientId).eq('phone', phone).single();
 
     const removed = await cleanupChatRows(h.supabase, clientId, phone);
 
     expect(removed.contacts).toBe(1);
     expect(removed.sheetOutbox).toBe(1);
-    expect(await outRows()).toHaveLength(0);
+    const { data: leftover } = await h.supabase.from('messages').select('id').eq('contact_id', (mine as { id: string }).id);
+    expect(leftover).toHaveLength(0);
     const { data: contacts } = await h.supabase.from('contacts').select('id').eq('client_id', clientId).eq('phone', phone);
     expect(contacts).toHaveLength(0);
     expect(logs()).not.toContain(phone);

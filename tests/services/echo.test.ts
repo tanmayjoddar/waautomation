@@ -86,4 +86,32 @@ describe('echo skips', () => {
     expect(text()).not.toContain(PHONE);
     expect(text()).not.toContain(TEXT);
   });
+
+  it('a failed out-row save is reported as sent, not as a failed reply', async () => {
+    // The customer HAS the reply in this case; only our record of it failed.
+    // Saying "echo reply failed" would send the next debugging session to
+    // Meta instead of the database.
+    const { deps, fake, text } = setup();
+    deps.supabase = {
+      from: () => ({
+        insert: () => ({
+          select: () => ({
+            single: async () => ({ data: null, error: { message: 'db is down', code: 'XX000' } }),
+          }),
+        }),
+      }),
+    } as unknown as SupabaseClient;
+
+    const result = await handleStoredMessageForEcho(deps, info({}));
+
+    expect(result).toBe('sent-not-saved');
+    expect(fake.sent).toHaveLength(1);
+    const out = text();
+    expect(out).not.toContain('echo reply failed');
+    const record = records(out).find((r) => typeof r['msg'] === 'string' && (r['msg'] as string).includes('out row was not saved'));
+    expect(record, 'no save-failure line was logged').toBeDefined();
+    expect(record?.['level']).toBe('error');
+    expect(out).not.toContain(PHONE);
+    expect(out).not.toContain(TEXT);
+  });
 });

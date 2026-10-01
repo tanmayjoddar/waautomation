@@ -62,9 +62,10 @@ describe('resolveWhatsAppClient', () => {
     const result = await client.sendText(TO, 'would-be reply');
     await client.markReadAndType('wamid.IN.1');
 
-    expect(result.wamid).toMatch(/^wamid\.FAKE\.\d+$/);
+    expect(result.wamid).toMatch(/^wamid\.FAKE\./);
     const out = chunks.join('');
     expect(out).toContain('would-be reply');
+    expect(out).toContain('typing indicator skipped');
     expect(out).not.toContain(TO);
     expect(out).not.toContain(DEMO_TOKEN);
   });
@@ -93,7 +94,7 @@ describe('consoleClient', () => {
 
     const result = await client.sendText(TO, 'hello console');
 
-    expect(result.wamid).toMatch(/^wamid\.FAKE\.\d+$/);
+    expect(result.wamid).toMatch(/^wamid\.FAKE\./);
     expect(chunks.join('')).toContain('hello console');
     expect(chunks.join('')).not.toContain(TO);
   });

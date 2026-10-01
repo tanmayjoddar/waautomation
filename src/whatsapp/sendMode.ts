@@ -49,6 +49,10 @@ export function consoleClient(
     },
     async markReadAndType(wamid: string): Promise<void> {
       await fake.markReadAndType(wamid);
+      // Said out loud because the alternative is confusing: in console mode
+      // nothing reaches the phone, so there is no blue tick and no "typing..."
+      // to watch. The read IS recorded on the fake for tests.
+      out.write('[console] mark-as-read + typing indicator skipped (console mode: nothing reaches the phone)\n');
     },
   };
 }
