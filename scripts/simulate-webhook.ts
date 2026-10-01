@@ -3,6 +3,7 @@
  *
  *   npm run simulate:webhook                 # all samples against localhost:3000
  *   npm run simulate:webhook -- --url https://my-host/webhook
+ *   npm run simulate:webhook -- --cleanup    # delete this script's rows, no server needed
  *
  * The point is to exercise the real HTTP path end to end without Meta: every
  * request is signed with META_APP_SECRET exactly the way Meta signs it, so the
@@ -17,6 +18,7 @@
  * secret is never printed.
  */
 import { pathToFileURL } from 'node:url';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { EnvError, loadEnvFromFile } from '../src/config.js';
 import { createLogger } from '../src/logger.js';
 import { signPayload } from '../src/webhook/signature.js';
@@ -203,8 +205,14 @@ export async function simulate(options: { url: string; routedId: string; appSecr
   }
 
   logger.info(
-    { samples: samples.length, accepted: sent, failed, unsigned_rejected: rejected },
-    'webhook simulation done (re-run to see duplicate deliveries being ignored)',
+    {
+      samples: samples.length,
+      accepted: sent,
+      failed,
+      unsigned_rejected: rejected,
+      phone_number_id: options.routedId,
+    },
+    'webhook simulation done. This proves the HTTP surface only: 200 means the signature was accepted and the work was queued, NOT that a row was written, because the 200 is returned before ingest. Check the server log line with "stored":N>0, or look in the database. Re-running sends the same wamids, so the second run must report "duplicates" instead of "stored".',
   );
   return { sent, failed };
 }
@@ -223,6 +231,146 @@ async function verify(url: string, verifyToken: string): Promise<boolean> {
   return ok;
 }
 
+// =============================================================================
+// Direct database access.
+//
+// Two jobs need it, and neither can be done over HTTP:
+//
+//   1. The status sample reports on wamid.SIM.OUTBOUND-1/2, which are messages
+//      the app sent EARLIER through the Cloud API. Meta only sends a delivery
+//      status for a message it already accepted from us, and a webhook delivery
+//      can never contain an outbound row, so without seeding those two rows the
+//      status sample can only ever answer "status for an unknown wamid".
+//   2. Cleaning up afterwards. Every simulated inbound message is written with
+//      the fixed wamid.SIM prefix, which makes it identifiable, but the demo
+//      tenant is the user's real tenant and must not be left full of test rows.
+//
+// Everything here is best-effort and clearly reported: the HTTP simulation is the
+// point of this script and it still runs when the database is unavailable.
+// =============================================================================
+
+/** The two outbound wamids the status sample reports on. */
+const OUTBOUND_WAMIDS = [`${WAMID_PREFIX}.OUTBOUND-1`, `${WAMID_PREFIX}.OUTBOUND-2`];
+
+/** Fixed fake number (E.164 digits) for the contacts this simulator creates. */
+const SIM_CONTACT_PHONE = '15550100999';
+
+/** Postgres unique_violation: this row is already there, which is fine. */
+const UNIQUE_VIOLATION = '23505';
+
+function database(config: ReturnType<typeof loadEnvFromFile>): SupabaseClient | null {
+  if (config.supabase.url === null || config.supabase.serviceRoleKey === null) {
+    logger.warn({}, 'SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are not set, so the simulator cannot seed or clean up its own rows');
+    return null;
+  }
+  return createClient(config.supabase.url, config.supabase.serviceRoleKey, { auth: { persistSession: false } });
+}
+
+/** The tenant the samples route to, or null when that phone_number_id is unknown. */
+async function routedClientId(db: SupabaseClient, phoneNumberId: string): Promise<string | null> {
+  const { data, error } = await db.from('clients').select('id').eq('phone_number_id', phoneNumberId).maybeSingle();
+  if (error) throw new Error(`cannot look up the client for phone_number_id: ${error.message}`);
+  return data?.id ?? null;
+}
+
+/**
+ * The contacts this simulator owns, found by DATA rather than by a stored flag:
+ * any contact holding a simulated wamid, plus the fixed simulator number. A run
+ * that died halfway through is therefore still cleanable.
+ */
+async function simulatedContactIds(db: SupabaseClient, clientId: string): Promise<string[]> {
+  const ids = new Set<string>();
+
+  const { data: messages, error: messageError } = await db
+    .from('messages')
+    .select('contact_id')
+    .eq('client_id', clientId)
+    .like('wamid', `${WAMID_PREFIX}.%`);
+  if (messageError) throw new Error(`cannot list simulated messages: ${messageError.message}`);
+  for (const row of messages ?? []) if (row.contact_id) ids.add(row.contact_id as string);
+
+  const { data: byPhone, error: phoneError } = await db
+    .from('contacts')
+    .select('id')
+    .eq('client_id', clientId)
+    .eq('phone', SIM_CONTACT_PHONE);
+  if (phoneError) throw new Error(`cannot list the simulator contact: ${phoneError.message}`);
+  for (const row of byPhone ?? []) ids.add(row.id as string);
+
+  return [...ids];
+}
+
+/**
+ * Inserts the two outbound rows the status sample reports on. Returns how many
+ * were created; an existing wamid is skipped, so repeated runs stay idempotent.
+ */
+async function seedOutboundSamples(db: SupabaseClient, clientId: string): Promise<number> {
+  const { data: existing, error: lookupError } = await db
+    .from('contacts')
+    .select('id')
+    .eq('client_id', clientId)
+    .eq('phone', SIM_CONTACT_PHONE)
+    .maybeSingle();
+  if (lookupError) throw new Error(`cannot look up the simulator contact: ${lookupError.message}`);
+
+  let contactId = existing?.id as string | undefined;
+  if (contactId === undefined) {
+    const { data: created, error: createError } = await db
+      .from('contacts')
+      .insert({ client_id: clientId, phone: SIM_CONTACT_PHONE, name: 'Simulated contact' })
+      .select('id')
+      .single();
+    if (createError) throw new Error(`cannot create the simulator contact: ${createError.message}`);
+    contactId = created.id as string;
+  }
+
+  let seeded = 0;
+  for (const wamid of OUTBOUND_WAMIDS) {
+    const { error } = await db.from('messages').insert({
+      client_id: clientId,
+      contact_id: contactId,
+      wamid,
+      direction: 'out',
+      type: 'text',
+      text: '(simulated outbound message)',
+    });
+    if (error === null) seeded += 1;
+    else if (error.code !== UNIQUE_VIOLATION) throw new Error(`cannot seed ${wamid}: ${error.message}`);
+  }
+  return seeded;
+}
+
+/**
+ * Removes everything this simulator wrote into the tenant.
+ *
+ * sheet_outbox.entity_id has NO foreign key: it points at a contact OR a booking
+ * depending on `entity`, so Postgres cannot cascade it. Deleting the contacts
+ * would leave those rows behind as orphans pointing at rows that no longer
+ * exist, so they are deleted explicitly first. The contacts then cascade to
+ * messages, jobs, bookings and booking_events.
+ */
+async function cleanupSimulatedData(db: SupabaseClient, clientId: string): Promise<{ contacts: number; sheetOutbox: number }> {
+  const contactIds = await simulatedContactIds(db, clientId);
+  if (contactIds.length === 0) {
+    logger.info({}, 'nothing to clean up: this tenant holds no simulated rows');
+    return { contacts: 0, sheetOutbox: 0 };
+  }
+
+  const { data: outbox, error: outboxError } = await db
+    .from('sheet_outbox')
+    .delete()
+    .eq('client_id', clientId)
+    .eq('entity', 'contact')
+    .in('entity_id', contactIds)
+    .select('id');
+  if (outboxError) throw new Error(`cannot delete simulated sheet_outbox rows: ${outboxError.message}`);
+
+  const { data: contacts, error: contactError } = await db.from('contacts').delete().in('id', contactIds).select('id');
+  if (contactError) throw new Error(`cannot delete simulated contacts: ${contactError.message}`);
+
+  return { contacts: contacts?.length ?? 0, sheetOutbox: outbox?.length ?? 0 };
+}
+
 const argValue = (flag: string): string | undefined => {
   const index = process.argv.indexOf(flag);
   return index === -1 ? undefined : process.argv[index + 1];
@@ -237,7 +385,46 @@ if (isMain) {
     const config = loadEnvFromFile();
     const appSecret = config.meta?.appSecret ?? SECRET;
     const url = argValue('--url') ?? `http://127.0.0.1:${config.port}/webhook`;
-    const routedId = argValue('--phone-number-id') ?? process.env['WA_PHONE_NUMBER_ID'] ?? 'SIMULATED-PHONE-NUMBER-ID';
+    // Read the phone number id from the loaded config, NOT from process.env:
+    // loadEnvFromFile() parses .env into `config` and never writes to the
+    // environment, so process.env.WA_PHONE_NUMBER_ID is normally unset and the
+    // old lookup silently fell back to the placeholder below. Every sample then
+    // carried an unroutable id, the server ignored all of them, and the run
+    // still reported "accepted: 8" because a 200 is returned before ingest.
+    const routedId = argValue('--phone-number-id') ?? config.whatsappDemo?.phoneNumberId ?? 'SIMULATED-PHONE-NUMBER-ID';
+    const cleaningUp = process.argv.includes('--cleanup');
+    if (routedId === 'SIMULATED-PHONE-NUMBER-ID') {
+      logger.warn(
+        {},
+        'WA_PHONE_NUMBER_ID is not available, so the samples carry a placeholder phone_number_id: the server will ignore every one of them and NOTHING will be written to the database. Set WA_PHONE_NUMBER_ID in .env (npm run seed puts it on the client) or pass --phone-number-id.',
+      );
+    }
+
+    // --cleanup only touches the database, so it never needs a running server.
+    if (cleaningUp) {
+      const db = database(config);
+      if (db === null || routedId === 'SIMULATED-PHONE-NUMBER-ID') return;
+      const clientId = await routedClientId(db, routedId);
+      if (clientId === null) {
+        logger.warn({}, 'no client has that phone_number_id, so there is nothing to clean up');
+        return;
+      }
+      const removed = await cleanupSimulatedData(db, clientId);
+      logger.info(removed, 'simulated rows removed (contacts cascade to messages, jobs, bookings and booking_events)');
+      return;
+    }
+
+    // Give the status sample something to report on before sending anything.
+    const db = database(config);
+    if (db !== null && routedId !== 'SIMULATED-PHONE-NUMBER-ID') {
+      const clientId = await routedClientId(db, routedId);
+      if (clientId === null) {
+        logger.warn({}, 'no client has that phone_number_id: the server will ignore every sample. Run npm run seed, or pass --phone-number-id.');
+      } else {
+        const seeded = await seedOutboundSamples(db, clientId);
+        logger.info({ seeded }, 'outbound rows ready for the status sample to report on');
+      }
+    }
 
     if (config.meta !== null) {
       await verify(url, config.meta.verifyToken);

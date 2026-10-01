@@ -121,14 +121,27 @@ describe.skipIf(!ready.ok)(suiteName, () => {
     const { error: memberError } = await h.supabase.from('client_users').insert({ client_id: clientId, user_id: userId });
     if (memberError) throw new Error(`cannot add the test user to the client: ${memberError.message}`);
 
+    // Sign in on the client we are going to KEEP. anon() builds a fresh client on
+    // every call, so signing in on a throwaway one loses the session: `asUser`
+    // would then be an unauthenticated client and every assertion in the
+    // "authenticated dashboard user" block would silently run as the anon role
+    // instead (which is refused by the very grants under test).
+    const userClient = anon();
     const signedIn = await retry(6, 500, async () => {
-      const attempt = await anon().auth.signInWithPassword({ email, password });
+      const attempt = await userClient.auth.signInWithPassword({ email, password });
       return !attempt.error;
     });
     if (!signedIn) {
       throw new Error('could not sign in as the privileges test user; check the Supabase auth rate limit in the dashboard');
     }
-    asUser = anon();
+    // Guard against exactly the bug this file had: if the client is not signed
+    // in as our dashboard user, the "authenticated" assertions below quietly run
+    // as anon and report a permission failure that does not exist.
+    const { data: sessionData } = await userClient.auth.getSession();
+    if (sessionData.session?.user.id !== userId) {
+      throw new Error('the test client is not signed in as the dashboard test user, so the authenticated checks would run as anon');
+    }
+    asUser = userClient;
   });
 
   afterAll(async () => {

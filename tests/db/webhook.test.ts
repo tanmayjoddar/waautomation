@@ -123,7 +123,12 @@ describe.skipIf(!ready.ok)(suiteName, () => {
         direction: 'in',
         type: 'text',
         text: body.text,
-        status: 'received',
+        // Spec 1.x, messages table: `status text, -- sent | delivered | read |
+        // failed`. That column only ever receives Meta's delivery callbacks,
+        // and Meta sends those for OUTBOUND messages only, so an inbound row
+        // must keep a NULL status. It is not "received" - the arrival is
+        // already recorded by direction = 'in' plus created_at.
+        status: null,
         media_id: null,
       });
       expect(rows[0]?.client_id).toBe(harness.config ? clientId : clientId);

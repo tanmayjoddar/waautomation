@@ -140,6 +140,13 @@ create table if not exists messages (
 create index if not exists messages_contact_created on messages (contact_id, seq desc);
 create index if not exists messages_wamid on messages (wamid) where wamid is not null;
 
+-- media_id arrived in Slice 2, AFTER most projects had already created this
+-- table, and `create table if not exists` leaves an existing table untouched. So
+-- the column has to be added explicitly as well, or a re-run silently does
+-- nothing and every inbound insert then fails with "column media_id does not
+-- exist".
+alter table messages add column if not exists media_id text;
+
 -- -------------------------------------------------------------------- bookings
 create table if not exists bookings (
   id uuid primary key default gen_random_uuid(),
