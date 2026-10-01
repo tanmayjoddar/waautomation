@@ -65,6 +65,11 @@ const envSchema = z.object({
   QUIET_HOURS_START: timeString.default('22:00'),
   QUIET_HOURS_END: timeString.default('07:00'),
 
+  // Slice 3 only, removed in Slice 4: temporary "I got: <text>" echo for the
+  // demo client. Strict enum on purpose: ECHO_MODE=yes must NOT silently mean
+  // "send real WhatsApp messages".
+  ECHO_MODE: z.enum(['true', 'false']).optional(),
+
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
 });
 
@@ -129,6 +134,8 @@ export type AppConfig = {
   meta: { appSecret: string; verifyToken: string; graphApiVersion: string } | null;
   whatsappDemo: { phoneNumberId: string; token: string } | null;
   encryptionKey: Buffer | null;
+  /** Slice 3 only: temporary echo for the demo client. Removed in Slice 4. */
+  echoMode: boolean;
   llm: { provider: 'gemini' | 'anthropic' | 'openai' | 'fake'; apiKey: string; model: string } | null;
   stt: { provider: 'openai-whisper' | 'gemini' | 'google' | 'sarvam' | 'fake'; apiKey: string } | null;
   telegram: { botToken: string; chatId: string } | null;
@@ -369,6 +376,7 @@ export function loadEnv(source: RawEnv = process.env): AppConfig {
       ? { phoneNumberId: e.WA_PHONE_NUMBER_ID as string, token: e.WA_TOKEN as string }
       : null,
     encryptionKey,
+    echoMode: e.ECHO_MODE === 'true',
     llm: features.llm
       ? {
           provider: e.LLM_PROVIDER as 'gemini' | 'anthropic' | 'openai' | 'fake',

@@ -140,6 +140,33 @@ delivery stores no second row and triggers no job, hook or sheet row. A
 `phone_number_id` that matches no client is logged and ignored (another business
 on the same WABA), never used to create a tenant.
 
+## WhatsApp adapter (Slice 3)
+
+All Meta calls live in `src/whatsapp/client.ts`: `sendText` and
+`markReadAndType` only. Every call has a 10s timeout and exactly one retry on
+5xx/network errors; 4xx is never retried. Written against the current Meta docs
+(see the links at the top of `client.ts`); the failure envelope is assumed to be
+the standard Graph shape and is marked `[VERIFY]` in the code.
+
+Slice 3 also ships a **temporary** echo so the loop can be tested with a real
+phone before the Slice 4 worker exists: with `ECHO_MODE=true`, an inbound
+**text** to the **demo client** (the one with `WA_PHONE_NUMBER_ID`) gets
+`"I got: <text>"` back, after a `markReadAndType` so the phone shows
+"typing...". Rules: demo client only (resolved to a client id at startup, so a
+wiring mistake fails closed), duplicates never re-send (the hook fires only for
+newly stored rows), the outbound row is saved with Meta's wamid, and a Meta/DB
+failure is logged without breaking ingest. Slice 4 deletes `src/services/echo.ts`
+and this flag.
+
+```bash
+ECHO_MODE=true   # in .env, then restart the server
+```
+
+Turn it back to `false` before running the simulator: every sample would
+otherwise attempt a real send to an invalid number (logged as failed, harmless,
+but noisy). `tests/whatsapp/fake.ts` (`createFakeWhatsAppClient`) is the fake
+later slices' worker tests will use.
+
 ## Local smoke test
 
 ```bash
@@ -158,7 +185,7 @@ phone numbers are redacted (`919812345678` -> `91********78`).
 | **0** | Scaffold, `config.ts`, `.env.example`, logging, vitest, `.gitignore` | **done** |
 | **1** | Migration SQL, Supabase client, seed script, RLS and function tests | **done** (88 tests green against a real project) |
 | **2** | Webhook GET/POST, signature verification, dedupe, `simulate-webhook.ts` | **done** (code done; the live suites need the updated migration re-run) |
-| 3 | WhatsApp client adapter (`sendText`, `markReadAndType`) | not started |
+| 3 | WhatsApp client adapter (`sendText`, `markReadAndType`), temporary demo echo | **done** (mocked adapter tests + live echo tests against a fake client) |
 | 4 | Worker + debounce + LLM adapter + prompt + zod schema | not started |
 | 5 | Voice notes: media download + STT adapter | not started |
 | 6 | Human-like pacing | not started |

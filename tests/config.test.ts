@@ -480,3 +480,19 @@ describe('.env.example stays in sync with config.ts', () => {
     }
   });
 });
+
+describe('ECHO_MODE (Slice 3 only, removed in Slice 4)', () => {
+  it('defaults to false', () => {
+    expect(loadEnv(baseEnv()).echoMode).toBe(false);
+  });
+
+  it('enables the demo echo on exactly "true"', () => {
+    expect(loadEnv(baseEnv({ ECHO_MODE: 'true' })).echoMode).toBe(true);
+    expect(loadEnv(baseEnv({ ECHO_MODE: 'false' })).echoMode).toBe(false);
+  });
+
+  it('rejects anything else: a truthy-looking typo must never mean "send real messages"', () => {
+    expect(() => loadEnv(baseEnv({ ECHO_MODE: 'yes' }))).toThrow(EnvError);
+    expect(() => loadEnv(baseEnv({ ECHO_MODE: '1' }))).toThrow(EnvError);
+  });
+});

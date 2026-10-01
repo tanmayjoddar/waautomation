@@ -6,27 +6,12 @@ import { createApp } from './app.js';
 import { EnvError, getConfig, type AppConfig } from './config.js';
 import { createServiceClient } from './db/supabase.js';
 import { createLogger, type LogLevel } from './logger.js';
+import type { Logger } from 'pino';
+import type { Express } from 'express';
+import { createEchoHooks } from './services/echo.js';
 import { drainBackgroundWork } from './webhook/route.js';
 
-function main(): void {
-  let config: AppConfig;
-  try {
-    config = getConfig();
-  } catch (err) {
-    if (err instanceof EnvError) {
-      process.stderr.write(`${err.message}\n`);
-      process.exit(1);
-    }
-    throw err;
-  }
-
-  const logger = createLogger({ level: config.logLevel as LogLevel });
-  // The webhook needs it; creating the client does no network I/O, so a database
-  // that is down is reported per request instead of stopping the server from
-  // starting.
-  const supabase = createServiceClient(config);
-
-  const app = createApp({ config, logger, supabase });
+function listen(app: Express, config: AppConfig, logger: Logger): void {
   const server = app.listen(config.port, () => {
     const base = config.publicBaseUrl ?? `http://localhost:${config.port}`;
     logger.info({ port: config.port, baseUrl: base }, 'listening');
@@ -52,4 +37,34 @@ function main(): void {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
-main();
+async function main(): Promise<void> {
+  let config: AppConfig;
+  try {
+    config = getConfig();
+  } catch (err) {
+    if (err instanceof EnvError) {
+      process.stderr.write(`${err.message}\n`);
+      process.exit(1);
+    }
+    throw err;
+  }
+
+  const logger = createLogger({ level: config.logLevel as LogLevel });
+  // The webhook needs it; creating the client does no network I/O, so a database
+  // that is down is reported per request instead of stopping the server from
+  // starting.
+  const supabase = createServiceClient(config);
+
+  // Slice 3: temporary echo for the demo client. Resolved BEFORE listening so a
+  // delivery can never land before the wiring exists. A database that is down
+  // at startup only disables the echo (logged below); the webhook itself still
+  // answers and stores, per request. Slice 4 deletes this block and echo.ts.
+  const hooks = await createEchoHooks({ config, logger, supabase }).catch((err: unknown) => {
+    logger.error({ err }, 'echo wiring failed: continuing without echo');
+    return undefined;
+  });
+
+  listen(createApp({ config, logger, supabase, hooks }), config, logger);
+}
+
+void main();

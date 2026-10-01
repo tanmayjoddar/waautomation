@@ -34,12 +34,25 @@ export type IngestDeps = {
   /** Seconds of debounce for the reply job. */
   debounceSeconds: number;
   /**
-   * Hooks for later slices, all no-ops here. Slice 3 sends "typing...", Slice 7
-   * runs the booking confirmation handler, Slice 4/8 own the worker.
+   * Hooks for later slices, all no-ops here. Slice 3 sends "typing..." and the
+   * temporary echo, Slice 7 runs the booking confirmation handler, Slice 4/8
+   * own the worker.
+   *
+   * onMessageStored fires ONLY for a newly stored message: both duplicate
+   * paths return before it, so a Meta retry can never trigger a second send.
+   * The contact phone and text travel in the arguments (never in a log line);
+   * the Slice 3 echo needs the phone to reply to and the text to echo.
    */
   hooks?: {
     /** Spec 1.6: mark read + show typing as soon as the message lands. */
-    onMessageStored?: (info: { clientId: string; wamid: string; type: MessageType }) => void | Promise<void>;
+    onMessageStored?: (info: {
+      clientId: string;
+      contactId: string;
+      contactPhone: string;
+      wamid: string;
+      type: MessageType;
+      text: string | null;
+    }) => void | Promise<void>;
     /** Spec 1.6: one polite reply for a type we cannot read. */
     onUnsupportedType?: (info: { clientId: string; wamid: string | null }) => void | Promise<void>;
   };
@@ -162,12 +175,13 @@ async function handleMessage(
     last_inbound_at: message.at,
   });
 
+  const storedText = toStoredText(message);
   const stored = await insertInboundMessage(deps.supabase, {
     clientId,
     contactId: contact.id,
     wamid: message.wamid,
     type,
-    text: toStoredText(message),
+    text: storedText,
     mediaId: message.kind === 'audio' ? message.mediaId : null,
     at: message.at,
   });
@@ -189,7 +203,16 @@ async function handleMessage(
   }
 
   // Fire and forget: the customer should see "typing..." before we queue any work.
-  await deps.hooks?.onMessageStored?.({ clientId, wamid: message.wamid, type });
+  // The hook runs only here, after a genuinely new row: duplicates returned
+  // above, so they can never cause a second send.
+  await deps.hooks?.onMessageStored?.({
+    clientId,
+    contactId: contact.id,
+    contactPhone,
+    wamid: message.wamid,
+    type,
+    text: storedText,
+  });
 
   if (message.kind === 'unsupported') {
     summary.unsupported += 1;

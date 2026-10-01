@@ -271,3 +271,38 @@ export async function queueSheetContact(
   });
   if (error) throw new Error(`queueSheetContact failed: ${error.message}`);
 }
+
+/**
+ * insertOutboundMessage: stores a message WE sent (Slice 3 echo, Slice 4+
+ * worker replies) with the wamid Meta returned, so later status webhooks can
+ * update it via updateMessageStatus.
+ *
+ * A plain insert, deliberately NOT an upsert: a fresh Meta wamid must never
+ * collide, and a 23505 here means something is deeply wrong and must surface
+ * instead of being silently swallowed as a "duplicate".
+ */
+export async function insertOutboundMessage(
+  supabase: SupabaseClient,
+  row: {
+    clientId: string;
+    contactId: string;
+    wamid: string;
+    type: Message['type'];
+    text: string | null;
+  },
+): Promise<Message> {
+  const { data, error } = await supabase
+    .from('messages')
+    .insert({
+      client_id: row.clientId,
+      contact_id: row.contactId,
+      wamid: row.wamid,
+      direction: 'out',
+      type: row.type,
+      text: row.text,
+    })
+    .select('*')
+    .single();
+  if (error) throw new Error(`insertOutboundMessage failed: ${error.message}`);
+  return data as Message;
+}
