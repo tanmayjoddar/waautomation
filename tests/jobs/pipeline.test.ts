@@ -29,6 +29,7 @@ import {
   AUDIO_ONLY_TEXT,
   FALLBACK_REPEAT_TEXT,
   FALLBACK_TEXT,
+  FatalJobError,
   HANDOVER_TEXT,
   SLOW_DOWN_TEXT,
   TEAM_CONFIRM_TEXT,
@@ -186,6 +187,28 @@ describe.skipIf(!ready.ok)(suiteName, () => {
   const claimJob = async (contact: Contact, delaySeconds = 0): Promise<Job> => {
     await enqueueReplyJob(h.supabase, clientId, contact.id, delaySeconds);
     const job = await claimDueJob(h.supabase, clientId);
+    expect(job, "a job must be claimable").not.toBeNull();
+    return job as Job;
+  };
+
+  /** Variants scoped to an explicit client, for the tokenless-tenant tests. */
+  const addInboundFor = async (tenantId: string, contact: Contact, text: string): Promise<void> => {
+    const wamid = `wamid.PIPE.${h.tag}.${contact.phone}.${Date.now()}.${Math.floor(Math.random() * 1e6)}`;
+    const { error } = await h.supabase.from("messages").insert({
+      client_id: tenantId,
+      contact_id: contact.id,
+      wamid,
+      direction: "in",
+      type: "text",
+      text,
+    });
+    expect(error, "cannot insert an inbound test message").toBeNull();
+    await h.supabase.from("contacts").update({ last_inbound_at: new Date().toISOString() }).eq("id", contact.id);
+  };
+
+  const claimJobFor = async (tenantId: string, contact: Contact): Promise<Job> => {
+    await enqueueReplyJob(h.supabase, tenantId, contact.id, 0);
+    const job = await claimDueJob(h.supabase, tenantId);
     expect(job, "a job must be claimable").not.toBeNull();
     return job as Job;
   };
@@ -583,7 +606,7 @@ describe.skipIf(!ready.ok)(suiteName, () => {
   );
 
   it(
-    "bot_paused contacts are never answered",
+    "bot_paused contacts fail fast without retries: the human owns the chat",
     test(async () => {
       const contact = await newContact(undefined, { bot_paused: true });
       await addInbound(contact, "hello?");
@@ -591,7 +614,7 @@ describe.skipIf(!ready.ok)(suiteName, () => {
       const { deps, sender } = depsFor(fake);
       const job = await claimJob(contact);
 
-      await runReplyJob(deps, job);
+      await expect(runReplyJob(deps, job)).rejects.toThrow(FatalJobError);
 
       expect(fake.calls).toHaveLength(0);
       expect(sender.sent).toHaveLength(0);
@@ -945,10 +968,136 @@ describe.skipIf(!ready.ok)(suiteName, () => {
       const pausingDeps = { ...deps, llm: pausing as never };
       const job = await claimJob(contact);
 
-      await runReplyJob(pausingDeps, job);
+      await expect(runReplyJob(pausingDeps, job)).rejects.toThrow(
+        /paused mid-pipeline/,
+      );
 
       expect(await outRows(contact.id)).toHaveLength(0);
-      expect(logs()).toContain("paused mid-pipeline");
+    }),
+  );
+
+  it(
+    "no WhatsApp token: no LLM call, no retry, one alert, attempts untouched",
+    test(async () => {
+      // A second tenant with no token anywhere: not the demo number (so the
+      // demo token does not apply) and no wa_token_enc of its own.
+      const { data: other, error: otherError } = await h.supabase
+        .from("clients")
+        .insert({
+          business_name: `${NAMESPACE}notoken-${h.tag}`,
+          phone_number_id: `${h.tag}-notoken`,
+        })
+        .select("id")
+        .single();
+      expect(otherError, "cannot create the tokenless client").toBeNull();
+      const otherId = (other as { id: string }).id;
+      const { data: contact } = await h.supabase
+        .from("contacts")
+        .insert({
+          client_id: otherId,
+          phone: testPhone(h.tag, 84),
+          last_inbound_at: new Date().toISOString(),
+        })
+        .select("*")
+        .single();
+      await addInboundFor(otherId, contact as Contact, "hello?");
+      const fake = createFakeLlm([{ text: replyJson(["Hi."]) }]);
+      const { deps, sender } = depsFor(fake);
+      // Live mode: the production rule (token required) applies. Console
+      // mode legitimately skips tokens for allowlisted tenants. Real
+      // notifier: this test proves the production alert path end to end.
+      const logger = createLogger({ level: "debug", destination: stream });
+      const liveDeps = {
+        ...deps,
+        config: testConfig({ SEND_MODE: "live" }),
+        notifier: createDbNotifier(h.supabase, logger),
+      };
+      const job = await claimJobFor(otherId, contact as Contact);
+
+      const settled = await settleJob(h.supabase, logger, liveDeps, job);
+
+      expect(settled.outcome).toBe("failed");
+      expect(fake.calls).toHaveLength(0);
+      expect(sender.sent).toHaveLength(0);
+      const { data: row } = await h.supabase
+        .from("jobs")
+        .select("status,attempts,last_error")
+        .eq("id", job.id)
+        .single();
+      expect(row).toMatchObject({ status: "failed" });
+      expect((row as { attempts: number }).attempts).toBe(1);
+      const { data: alerts } = await h.supabase
+        .from("staff_alerts")
+        .select("id")
+        .eq("client_id", otherId)
+        .eq("kind", "job_failed");
+      expect(alerts).toHaveLength(1);
+      await h.supabase.from("clients").delete().eq("id", otherId);
+    }),
+  );
+
+  it(
+    "inactive client: fails fast without retries",
+    test(async () => {
+      const contact = await newContact();
+      await addInbound(contact, "hello?");
+      await h.supabase.from("clients").update({ active: false }).eq("id", clientId);
+      const fake = createFakeLlm([{ text: replyJson(["Hi."]) }]);
+      const { deps } = depsFor(fake);
+      const job = await claimJob(contact);
+      try {
+        await expect(runReplyJob(deps, job)).rejects.toThrow(FatalJobError);
+        expect(fake.calls).toHaveLength(0);
+      } finally {
+        await h.supabase.from("clients").update({ active: true }).eq("id", clientId);
+      }
+    }),
+  );
+
+  it(
+    "deleted contact: fails fast without retries",
+    test(async () => {
+      const contact = await newContact();
+      await addInbound(contact, "hello?");
+      const fake = createFakeLlm([{ text: replyJson(["Hi."]) }]);
+      const { deps } = depsFor(fake);
+      const job = await claimJob(contact);
+      await h.supabase.from("contacts").delete().eq("id", contact.id);
+
+      await expect(runReplyJob(deps, job)).rejects.toThrow(/gone/);
+      expect(fake.calls).toHaveLength(0);
+    }),
+  );
+
+  it(
+    "paused contact settles as failed with one alert, never retried",
+    test(async () => {
+      const contact = await newContact(undefined, { bot_paused: true });
+      await addInbound(contact, "hello?");
+      const fake = createFakeLlm([]);
+      const { deps } = depsFor(fake);
+      // Real notifier here (not the capture stub): this test proves the
+      // production path writes exactly one staff_alerts row.
+      const logger = createLogger({ level: "debug", destination: stream });
+      const realDeps = { ...deps, notifier: createDbNotifier(h.supabase, logger) };
+      const job = await claimJob(contact);
+
+      const settled = await settleJob(h.supabase, logger, realDeps, job);
+
+      expect(settled.outcome).toBe("failed");
+      const { data: row } = await h.supabase
+        .from("jobs")
+        .select("status,attempts")
+        .eq("id", job.id)
+        .single();
+      expect(row).toMatchObject({ status: "failed", attempts: 1 });
+      const { data: alerts } = await h.supabase
+        .from("staff_alerts")
+        .select("id")
+        .eq("client_id", clientId)
+        .eq("kind", "job_failed")
+        .eq("job_id", job.id);
+      expect(alerts).toHaveLength(1);
     }),
   );
 

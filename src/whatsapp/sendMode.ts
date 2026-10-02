@@ -31,6 +31,13 @@ export type ResolveOptions = {
   fetchImpl?: typeof fetch;
   /** Where console mode prints replies. Defaults to process.stdout. */
   out?: { write(chunk: string): void };
+  /**
+   * Extra phone_number_ids allowed console sends, beyond the demo client.
+   * A CODE parameter, deliberately never env or config: production callers
+   * (server, worker) never pass it, so it cannot be enabled in production
+   * without a code change. Test scripts (eval) pass their own tenant id.
+   */
+  extraConsoleAllowList?: string[];
 };
 
 export type ConsoleWhatsAppClient = WhatsAppClient & { fake: FakeWhatsAppClient };
@@ -70,7 +77,10 @@ export function resolveWhatsAppClient(
 ): WhatsAppClient {
   if (config.sendMode === 'console') {
     const demoNumberId = config.whatsappDemo?.phoneNumberId ?? null;
-    if (demoNumberId === null || target.phoneNumberId !== demoNumberId) {
+    const allowed =
+      (demoNumberId !== null && target.phoneNumberId === demoNumberId) ||
+      (opts.extraConsoleAllowList ?? []).includes(target.phoneNumberId);
+    if (!allowed) {
       // No token, no phone number, no client id in the message: the refusal
       // itself must not leak addressing information either.
       throw new Error('SEND_MODE=console is allowed for the demo client only. Set SEND_MODE=live for anything else.');

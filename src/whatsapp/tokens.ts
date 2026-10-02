@@ -38,12 +38,25 @@ export function decryptToken(key: Buffer, encoded: string): string {
  * else -> their own decrypted token. Throws when sending is impossible, so a
  * misconfigured tenant fails LOUD at send time instead of sending as nobody.
  */
-export function resolveSendCredentials(config: AppConfig, client: Client): SendCredentials {
+export function resolveSendCredentials(
+  config: AppConfig,
+  client: Client,
+  opts: { allowMissingToken?: boolean } = {},
+): SendCredentials {
   if (config.whatsappDemo !== null && client.phone_number_id === config.whatsappDemo.phoneNumberId) {
     return { phoneNumberId: config.whatsappDemo.phoneNumberId, token: config.whatsappDemo.token };
   }
   if (!client.phone_number_id) throw new Error(`client ${client.id} has no phone_number_id: cannot send`);
-  if (!client.wa_token_enc) throw new Error(`client ${client.id} has no WhatsApp token stored: cannot send`);
+  // Console-mode fake sends never touch Meta, so tenants explicitly
+  // allowlisted for console (eval) need no stored token. Live mode always
+  // requires one: failing here (before any LLM call) is what makes a
+  // tokenless production client fail fast instead of burning retries.
+  if (!client.wa_token_enc) {
+    if (opts.allowMissingToken === true && config.sendMode === "console") {
+      return { phoneNumberId: client.phone_number_id, token: "" };
+    }
+    throw new Error(`client ${client.id} has no WhatsApp token stored: cannot send`);
+  }
   if (!config.encryptionKey) throw new Error('ENCRYPTION_KEY is required to decrypt per-client WhatsApp tokens');
   return { phoneNumberId: client.phone_number_id, token: decryptToken(config.encryptionKey, client.wa_token_enc) };
 }

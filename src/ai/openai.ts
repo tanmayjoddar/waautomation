@@ -25,6 +25,34 @@ export type OpenAIOptions = {
   baseDelayMs?: number;
 };
 
+/**
+ * Lists model ids for startup validation ([VERIFY] shape against the API
+ * reference: GET /v1/models with Bearer auth, {data: [{id}]}).
+ */
+export async function listOpenAiModels(
+  apiKey: string,
+  fetchImpl: typeof fetch = fetch,
+  timeoutMs = 10_000,
+): Promise<string[]> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetchImpl("https://api.openai.com/v1/models", {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      throw new Error(`list models failed with HTTP ${res.status}`);
+    }
+    const parsed = (await res.json()) as { data?: Array<{ id?: unknown }> };
+    return (parsed?.data ?? [])
+      .map((m) => (typeof m?.id === "string" ? m.id : null))
+      .filter((n): n is string => n !== null);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export function createOpenAIAdapter(options: OpenAIOptions): LlmAdapter {
   return {
     provider: 'openai',

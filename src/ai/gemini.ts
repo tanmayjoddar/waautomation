@@ -39,6 +39,37 @@ export type GeminiOptions = {
 const textOf = (value: unknown): string | null =>
   typeof value === "string" ? value : null;
 
+/**
+ * Lists model ids for startup validation ([VERIFY] shape against the Gemini
+ * REST reference: GET v1beta/models with the key, {models: [{name}]} where
+ * name looks like 'models/<id>'). Returns ids without the 'models/' prefix.
+ */
+export async function listGeminiModels(
+  apiKey: string,
+  fetchImpl: typeof fetch = fetch,
+  timeoutMs = 10_000,
+): Promise<string[]> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetchImpl(
+      "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100",
+      { headers: { "x-goog-api-key": apiKey }, signal: controller.signal },
+    );
+    if (!res.ok) {
+      throw new Error(`list models failed with HTTP ${res.status}`);
+    }
+    const parsed = (await res.json()) as {
+      models?: Array<{ name?: unknown }>;
+    };
+    return (parsed?.models ?? [])
+      .map((m) => (typeof m?.name === "string" ? m.name.replace(/^models\//, "") : null))
+      .filter((n): n is string => n !== null);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export function createGeminiAdapter(options: GeminiOptions): LlmAdapter {
   return {
     provider: "gemini",

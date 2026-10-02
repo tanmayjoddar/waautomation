@@ -8,7 +8,7 @@ import { createServiceClient } from './db/supabase.js';
 import { createLogger, type LogLevel } from './logger.js';
 import type { Logger } from 'pino';
 import type { Express } from 'express';
-import { createLlmAdapter } from './ai/index.js';
+import { createLlmAdapter, validateLlmModels } from './ai/index.js';
 import { startWorker, type WorkerHandle } from './jobs/worker.js';
 import { drainBackgroundWork } from './webhook/route.js';
 
@@ -61,13 +61,25 @@ async function main(): Promise<void> {
 
   // Slice 4 worker: answers queued reply jobs. Off unless enabled AND the LLM
   // trio is configured; either way the webhook is unaffected. Warned once, not
-  // on every poll, so a keyless dev server stays quiet.
+  // on every poll, so a keyless dev server stays quiet. Model names are
+  // validated against the provider before the first claim: a typo fails here,
+  // loudly, instead of failing every job quietly later.
   let worker: WorkerHandle | null = null;
   if (!config.worker.enabled) {
     logger.debug({}, 'worker disabled: WORKER_ENABLED is false');
   } else if (config.llm === null) {
     logger.warn({}, 'worker not started: set LLM_PROVIDER, LLM_API_KEY and LLM_MODEL to enable replies');
   } else {
+    try {
+      await validateLlmModels(config.llm, logger);
+    } catch (err) {
+      logger.error(
+        { err: err instanceof Error ? err.message : String(err) },
+        'worker not started: fix the LLM model configuration',
+      );
+      listen(createApp({ config, logger, supabase }), config, logger, null);
+      return;
+    }
     worker = startWorker({ supabase, logger, config, llm: createLlmAdapter(config.llm, logger) });
     logger.info(
       { pollMs: config.worker.pollMs, concurrency: config.worker.concurrency, provider: config.llm.provider },

@@ -83,6 +83,12 @@ export type PipelineDeps = {
   sender?: WhatsAppClient;
   /** Where console-mode sends print. Defaults to process.stdout; scripts capture it. */
   consoleOut?: { write(chunk: string): void };
+  /**
+   * Extra phone_number_ids the console sender may serve, beyond the demo
+   * client. Threaded through to the factory; the server and worker never set
+   * it. Scripts with their own tenant (eval) pass exactly one id.
+   */
+  consoleAllowList?: string[];
 };
 
 type Loaded = {
@@ -456,6 +462,10 @@ async function generateValidated(
   try {
     return { reply: await callWithFallback(userText, 1), fallback: null };
   } catch (err) {
+    // Run-abort errors (eval quota cap) propagate untouched: scripts/ own
+    // them, the pipeline must not translate them into fallbacks. Matched by
+    // name so src/ never imports scripts/.
+    if (err instanceof Error && err.name === "EvalCapError") throw err;
     if (err instanceof CircuitOpenError) {
       logger.warn(
         { clientId, jobId },
@@ -464,6 +474,7 @@ async function generateValidated(
       return { reply: null, fallback: "llm_error" };
     }
     if (err instanceof LlmError) {
+      await alertLlmPermanentError(deps, clientId, err);
       logger.warn(
         { clientId, jobId },
         "LLM unavailable after retries: fallback reply",
@@ -484,6 +495,7 @@ async function generateValidated(
       fallback: null,
     };
   } catch (err) {
+    if (err instanceof Error && err.name === "EvalCapError") throw err;
     if (err instanceof CircuitOpenError) {
       logger.warn(
         { clientId, jobId },
@@ -492,6 +504,7 @@ async function generateValidated(
       return { reply: null, fallback: "llm_error" };
     }
     if (err instanceof LlmError) {
+      await alertLlmPermanentError(deps, clientId, err);
       logger.warn(
         { clientId, jobId },
         "LLM unavailable on retry: fallback reply",
@@ -501,6 +514,26 @@ async function generateValidated(
     logger.warn({ clientId, jobId }, "LLM retry also invalid: fallback reply");
     return { reply: null, fallback: "invalid_json_twice" };
   }
+}
+
+/**
+ * Permanent provider errors (400/401/403/404: bad key, bad model, bad shape)
+ * raise one client-level staff alert the first time they appear. Transient
+ * errors (429/5xx/timeout) never alert: they clear on their own or the job
+ * fails loudly later. Provider name + status only, never content or keys.
+ */
+async function alertLlmPermanentError(
+  deps: PipelineDeps,
+  clientId: string,
+  err: LlmError,
+): Promise<void> {
+  if (err.status === null) return;
+  if (![400, 401, 403, 404].includes(err.status)) return;
+  await deps.notifier.notify(
+    clientId,
+    "llm_error",
+    `${deps.llm.provider}: HTTP ${err.status}${typeof err.providerCode === "number" || typeof err.providerCode === "string" ? ` (code ${err.providerCode})` : ""}`,
+  );
 }
 
 /** Code post-checks on a validated reply: price grounding, prompt secrecy, part count. */
@@ -540,6 +573,18 @@ function postChecksOk(
  * exhaustion both end in the fallback reply. Because parts persist with
  * (job_id, part_index), a retry resumes instead of repeating.
  */
+/**
+ * Permanent job failure: retrying cannot help (no token, revoked client,
+ * deleted contact, paused contact), so the worker must fail the job at once
+ * instead of burning three attempts. Caught by settleJob, which marks the job
+ * failed and raises one staff alert.
+ */
+export class FatalJobError extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = "FatalJobError";
+  }
+}
 export async function runReplyJob(
   deps: PipelineDeps,
   job: Job,
@@ -547,32 +592,39 @@ export async function runReplyJob(
   const { supabase, logger, config } = deps;
   const clientId = job.client_id;
 
-  // 1. Load everything, scoped to this tenant.
+  // 1. Load everything, scoped to this tenant. The checks below are all
+  // PERMANENT failures: retrying cannot help, so they throw FatalJobError
+  // (fail at once, one alert, no retries) instead of returning done.
   const contact = await loadContact(supabase, clientId, job.contact_id);
   if (contact === null) {
-    logger.warn(
-      { clientId, jobId: job.id },
-      "job contact is gone: marking done",
-    );
-    return { fallback: null };
+    throw new FatalJobError(`contact ${job.contact_id} is gone`);
   }
   const { client, settings, knowledge } = await loadClientBundle(
     supabase,
     clientId,
   );
   if (client === null || !client.active) {
-    logger.info(
-      { clientId, jobId: job.id },
-      "client missing or inactive: marking done",
+    throw new FatalJobError(
+      client === null
+        ? `client ${clientId} is gone`
+        : `client ${clientId} is not active`,
     );
-    return { fallback: null };
+  }
+  // Credentials before anything expensive: no token means no send is
+  // possible, so fail before the first LLM call, not after it. Console-mode
+  // allowlisted tenants (eval) are exempt here exactly as at send time; live
+  // mode always requires a token.
+  try {
+    resolveSendCredentials(config, client, { allowMissingToken: true });
+  } catch (err) {
+    throw new FatalJobError(
+      err instanceof Error ? err.message : String(err),
+    );
   }
   if (contact.bot_paused) {
-    logger.info(
-      { clientId, contactId: contact.id, jobId: job.id },
-      "contact is paused: sending nothing",
+    throw new FatalJobError(
+      `contact ${contact.id} is paused (human takeover)`,
     );
-    return { fallback: null };
   }
   const loaded: Loaded = {
     contact,
@@ -807,15 +859,14 @@ export async function runReplyJob(
   const reply = validated.reply;
 
   // A human may have taken over while the LLM call was in flight: re-read
-  // the contact and abandon the send if so. The reply is discarded, not
-  // queued, because anything sent now would talk over the human.
+  // the contact and fail fast if so. The reply is discarded, not queued,
+  // because anything sent now would talk over the human. Fatal, not silent:
+  // a retry would hit the same paused contact.
   const afterLlm = await loadContact(supabase, clientId, contact.id);
   if (afterLlm === null || afterLlm.bot_paused) {
-    logger.info(
-      { clientId, contactId: contact.id, jobId: job.id },
-      "paused mid-pipeline: abandoning send",
+    throw new FatalJobError(
+      `contact ${contact.id} paused mid-pipeline (human takeover)`,
     );
-    return { fallback: null };
   }
 
   // 9. Post-checks in code; any failure -> fallback, never the raw reply.
@@ -846,7 +897,11 @@ export async function runReplyJob(
       },
       "handed over to staff",
     );
-    await sendParts(deps, sender, job, contact, [HANDOVER_TEXT]);
+    await sendParts(deps, sender, job, contact, [HANDOVER_TEXT], {
+      // This pipeline step pauses the contact itself a few lines above; the
+      // handover text must still go out to tell the customer a human is coming.
+      skipPauseCheck: true,
+    });
     return { fallback: null };
   }
 
@@ -905,10 +960,14 @@ function senderFor(
   const { phoneNumberId, token } = resolveSendCredentials(
     deps.config,
     client as Parameters<typeof resolveSendCredentials>[1],
+    // Console fakes never touch Meta: allowlisted tenants (eval) send
+    // without a stored token. Live mode still requires one (see above).
+    { allowMissingToken: true },
   );
   const target: SendTarget = { clientId: client.id, phoneNumberId, token };
   return resolveWhatsAppClient(deps.config, deps.logger, target, {
     out: deps.consoleOut,
+    extraConsoleAllowList: deps.consoleAllowList,
   });
 }
 
@@ -929,9 +988,10 @@ async function sendParts(
   job: Job,
   contact: Contact,
   parts: string[],
+  opts: { skipPauseCheck?: boolean } = {},
 ): Promise<void> {
   const saved = await listJobParts(deps.supabase, job.id);
-  await sendSavedParts(deps, sender, job, contact, saved, parts);
+  await sendSavedParts(deps, sender, job, contact, saved, parts, opts);
 }
 
 /** Sends rows that lack a wamid; missing indexes are inserted first. */
@@ -942,6 +1002,7 @@ async function sendSavedParts(
   contact: Contact,
   saved: Message[],
   wanted?: string[],
+  opts: { skipPauseCheck?: boolean } = {},
 ): Promise<void> {
   const byIndex = new Map(saved.map((m) => [m.part_index, m]));
   const count = Math.max(saved.length, wanted?.length ?? 0);
@@ -963,17 +1024,21 @@ async function sendSavedParts(
     // Re-read the contact before every send: a human may have taken over
     // while the LLM call or an earlier part was in flight. Stopping here
     // leaves the remaining parts unsent; the human owns the chat now.
-    const current = await loadContact(
-      deps.supabase,
-      job.client_id,
-      contact.id,
-    );
-    if (current === null || current.bot_paused) {
-      deps.logger.info(
-        { clientId: job.client_id, contactId: contact.id, jobId: job.id },
-        "paused mid-send: stopping after the sent parts",
+    // Skipped only for the handover text itself, which is deliberately sent
+    // right after pausing (it tells the customer a human is coming).
+    if (opts.skipPauseCheck !== true) {
+      const current = await loadContact(
+        deps.supabase,
+        job.client_id,
+        contact.id,
       );
-      return;
+      if (current === null || current.bot_paused) {
+        // Fatal, not silent: the remaining parts stay unsent and the failure
+        // (plus alert) tells staff a takeover interrupted a reply.
+        throw new FatalJobError(
+          `contact ${contact.id} paused mid-send (human takeover)`,
+        );
+      }
     }
     // The row exists BEFORE the send: a crash here leaves a wamid-less part
     // that the next attempt resumes instead of duplicating.

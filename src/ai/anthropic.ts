@@ -27,6 +27,34 @@ export type AnthropicOptions = {
   baseDelayMs?: number;
 };
 
+/**
+ * Lists model ids for startup validation ([VERIFY] shape against the
+ * Messages/API reference: GET /v1/models, {data: [{id}]}).
+ */
+export async function listAnthropicModels(
+  apiKey: string,
+  fetchImpl: typeof fetch = fetch,
+  timeoutMs = 10_000,
+): Promise<string[]> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetchImpl("https://api.anthropic.com/v1/models", {
+      headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      throw new Error(`list models failed with HTTP ${res.status}`);
+    }
+    const parsed = (await res.json()) as { data?: Array<{ id?: unknown }> };
+    return (parsed?.data ?? [])
+      .map((m) => (typeof m?.id === "string" ? m.id : null))
+      .filter((n): n is string => n !== null);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export function createAnthropicAdapter(options: AnthropicOptions): LlmAdapter {
   return {
     provider: 'anthropic',

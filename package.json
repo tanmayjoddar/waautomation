@@ -18,6 +18,7 @@
     "chat": "tsx scripts/chat.ts",
     "resume": "tsx scripts/resume.ts",
     "eval": "tsx scripts/eval.ts",
+    "eval:cleanup": "tsx scripts/evalCleanup.ts",
     "alerts": "tsx scripts/alerts.ts",
     "summary": "tsx scripts/summary.ts",
     "env:check": "tsx scripts/check-env-keys.ts",

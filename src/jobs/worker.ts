@@ -18,6 +18,7 @@ import type { AppConfig } from "../config.js";
 import {
   claimDueJob,
   failJob,
+  failJobPermanent,
   markJobDone,
   requeueStaleJobs,
 } from "../db/supabase.js";
@@ -29,7 +30,11 @@ import {
   createDbNotifier,
   type StaffNotifier,
 } from "../staff/alerts.js";
-import { runReplyJob, type PipelineDeps } from "./pipeline.js";
+import {
+  FatalJobError,
+  runReplyJob,
+  type PipelineDeps,
+} from "./pipeline.js";
 
 export type WorkerDeps = {
   supabase: SupabaseClient;
@@ -90,6 +95,15 @@ export function pipelineDepsFor(
  * loop logs its own lines. Shared by the poll loop and scripts so both settle
  * jobs identically.
  */
+/**
+ * Runs one claimed job and records the outcome: done on success, back to
+ * pending with backoff (or failed when attempts are exhausted) on error.
+ * FatalJobError (permanent: no token, revoked client, deleted/paused
+ * contact) fails the job at once with one staff alert, no retries.
+ * Returns the outcome for callers that report it (scripts/chat.ts); the poll
+ * loop logs its own lines. Shared by the poll loop and scripts so both settle
+ * jobs identically.
+ */
 export async function settleJob(
   supabase: SupabaseClient,
   logger: Logger,
@@ -106,8 +120,20 @@ export async function settleJob(
     logger.info({ jobId: job.id, clientId: job.client_id }, "reply job done");
     return { outcome: "done", fallback };
   } catch (err) {
+    // Run-abort errors (eval quota cap) propagate untouched, like in the
+    // pipeline: recording them as job failures would lie about the cause.
+    if (err instanceof Error && err.name === "EvalCapError") throw err;
     const message = err instanceof Error ? err.message : String(err);
     try {
+      if (err instanceof FatalJobError) {
+        await failJobPermanent(supabase, job, message);
+        await pipeline.notifier.notify(job.client_id, "job_failed", message.slice(0, 200), {
+          contactId: job.contact_id,
+          jobId: job.id,
+        });
+        logger.warn({ jobId: job.id, clientId: job.client_id }, "reply job failed (permanent, no retry)");
+        return { outcome: "failed", error: message };
+      }
       const outcome = await failJob(supabase, job, message);
       logger.warn(
         { jobId: job.id, clientId: job.client_id, outcome },

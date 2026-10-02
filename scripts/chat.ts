@@ -57,9 +57,15 @@ export type ChatDeps = {
   sendGapMs?: number;
   /** Test seam: replaces the SEND_MODE-resolved sender. Production never sets it. */
   sender?: WhatsAppClient;
+  /**
+   * Extra tenant ids the console sender may serve, beyond the demo client.
+   * Scripts with their own tenant (eval) pass exactly one id; the interactive
+   * chat never sets it.
+   */
+  consoleAllowList?: string[];
 };
 
-export type ChatReply = { summary: IngestSummary; replies: string[] };
+export type ChatReply = { summary: IngestSummary; replies: string[]; fallbacks: string[] };
 
 let chatCounter = 0;
 
@@ -138,15 +144,24 @@ export async function chatOnce(
     notifier: createDbNotifier(deps.supabase, deps.logger),
     sendGapMs: deps.sendGapMs ?? 0,
     sender: deps.sender,
+    consoleAllowList: deps.consoleAllowList,
     // Swallowed on purpose: the factory would print every reply itself, and
     // this script prints its own cleaner `bot>` transcript below instead.
     consoleOut: { write: () => undefined },
   };
   const replies: string[] = [];
+  const fallbacks: string[] = [];
   for (let i = 0; i < MAX_DRAIN_ITERATIONS; i += 1) {
     const job = await claimDueJob(deps.supabase, deps.demoClientId);
     if (job === null) break;
     const settled = await settleJob(deps.supabase, deps.logger, pipeline, job);
+    if (
+      settled.fallback !== null &&
+      settled.fallback !== undefined &&
+      !fallbacks.includes(settled.fallback)
+    ) {
+      fallbacks.push(settled.fallback);
+    }
     const { data } = await deps.supabase
       .from("messages")
       .select("text, wamid")
@@ -170,7 +185,7 @@ export async function chatOnce(
       );
     }
   }
-  return { summary, replies };
+  return { summary, replies, fallbacks };
 }
 
 /**

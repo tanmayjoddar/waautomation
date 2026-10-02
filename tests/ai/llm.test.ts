@@ -6,10 +6,11 @@
  */
 import { describe, expect, it } from 'vitest';
 import { createLogger } from '../../src/logger.js';
-import { createAnthropicAdapter } from '../../src/ai/anthropic.js';
+import { createGeminiAdapter, listGeminiModels } from '../../src/ai/gemini.js';
+import { createOpenAIAdapter, listOpenAiModels } from '../../src/ai/openai.js';
+import { createAnthropicAdapter, listAnthropicModels } from '../../src/ai/anthropic.js';
 import { createFakeLlm } from '../../src/ai/fake.js';
-import { createGeminiAdapter } from '../../src/ai/gemini.js';
-import { createOpenAIAdapter } from '../../src/ai/openai.js';
+import { validateLlmModels } from '../../src/ai/index.js';
 import { LlmError, type GenerateInput } from '../../src/ai/llm.js';
 import { collectingStream } from '../helpers.js';
 
@@ -246,5 +247,57 @@ describe('fake adapter', () => {
     expect(third.text).toContain('reply_parts');
 
     expect(fake.calls.map((c) => c.userText)).toEqual(['one', 'two', 'three']);
+  });
+});
+
+describe('validateLlmModels', () => {
+  const logger = () => createLogger({ level: 'silent' });
+  const llm = (overrides: Record<string, unknown> = {}) => ({
+    provider: 'gemini',
+    apiKey: 'k',
+    model: 'gemini-3.5-flash-lite',
+    fallbackModel: null,
+    timeoutMs: 5000,
+    maxOutputTokens: 400,
+    ...overrides,
+  });
+
+  const listOk = (models: string[]) =>
+    (async () =>
+      new Response(JSON.stringify({ models: models.map((m) => ({ name: `models/${m}` })) }), { status: 200 })) as typeof fetch;
+
+  it('passes when both models exist and differ', async () => {
+    await expect(
+      validateLlmModels(llm({ fallbackModel: 'gemini-2.0-flash' }) as never, logger(), listOk(['gemini-3.5-flash-lite', 'gemini-2.0-flash'])),
+    ).resolves.toBeUndefined();
+  });
+
+  it('fails when the model is unknown', async () => {
+    await expect(validateLlmModels(llm() as never, logger(), listOk(['gemini-2.0-flash']))).rejects.toThrow(
+      /unknown gemini model.*gemini-3.5-flash-lite/,
+    );
+  });
+
+  it('fails when model and fallback are identical', async () => {
+    await expect(
+      validateLlmModels(llm({ fallbackModel: 'gemini-3.5-flash-lite' }) as never, logger(), listOk(['gemini-3.5-flash-lite'])),
+    ).rejects.toThrow(/must differ/);
+  });
+
+  it('warns and passes when the list endpoint is unreachable', async () => {
+    const down = (async () => {
+      throw new TypeError('fetch failed');
+    }) as typeof fetch;
+    await expect(validateLlmModels(llm() as never, logger(), down)).resolves.toBeUndefined();
+  });
+
+  it('skips validation for the fake provider without any fetch', async () => {
+    let called = false;
+    const spy = (async (...args: Parameters<typeof fetch>): Promise<Response> => {
+      called = true;
+      return fetch(...args);
+    }) as typeof fetch;
+    await expect(validateLlmModels(llm({ provider: 'fake' }) as never, logger(), spy)).resolves.toBeUndefined();
+    expect(called).toBe(false);
   });
 });

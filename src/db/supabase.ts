@@ -319,6 +319,17 @@ export async function failJob(supabase: SupabaseClient, job: Job, errorMessage: 
   return 'retried';
 }
 
+/**
+ * Records a terminal job failure immediately, without backoff or retries.
+ * For permanent errors only (no token, revoked client, deleted or paused
+ * contact): retrying cannot help, so attempts are left untouched and the job
+ * goes straight to failed with the reason on it.
+ */
+export async function failJobPermanent(supabase: SupabaseClient, job: Job, errorMessage: string): Promise<void> {
+  const { error } = await supabase.from('jobs').update({ status: 'failed', last_error: errorMessage }).eq('id', job.id);
+  if (error) throw new Error(`failJobPermanent failed: ${error.message}`);
+}
+
 /** requeue_stale_jobs(): returns how many running jobs went back to pending/failed. */
 export async function requeueStaleJobs(supabase: SupabaseClient, minutes: number): Promise<number> {
   const { data, error } = await supabase.rpc('requeue_stale_jobs', { p_minutes: minutes });
