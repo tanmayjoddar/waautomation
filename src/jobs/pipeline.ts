@@ -27,6 +27,7 @@ import {
   loadContact,
   recentOutboundWithText,
   setJobPartWamid,
+  sumLlmUnitsSince,
   updateContact,
   writeUsageLog,
 } from "../db/supabase.js";
@@ -42,10 +43,11 @@ import {
   buildSystemPrompt,
   formatKnowledge,
   trimHistory,
-  trimUserText,
+  trimUserTextWithNote,
 } from "../ai/prompt.js";
 import { parseReply } from "../ai/schema.js";
 import { LlmError, type LlmAdapter } from "../ai/llm.js";
+import { CircuitOpenError } from "../ai/circuitBreaker.js";
 import type { HistoryTurn } from "../ai/prompt.js";
 import type { Reply } from "../ai/schema.js";
 
@@ -56,40 +58,15 @@ export const SLOW_DOWN_TEXT =
   "Please slow down a little. I read every message and will reply shortly.";
 export const AUDIO_ONLY_TEXT =
   "Sorry, I can't listen to voice notes yet, could you type it?";
+export const CLARIFY_TEXT =
+  "Sorry, I didn't catch that. Could you type your question in words?";
 export const TEAM_CONFIRM_TEXT = "Our team will confirm the time shortly.";
 export const FALLBACK_REPEAT_TEXT =
   "Our team has your message and will reply soon.";
 const SLOW_DOWN_NOTICE_WINDOW_MS = 10 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-export type StaffAlert = {
-  clientId: string;
-  businessName: string;
-  contactId: string;
-  /** Full phone: staff must reach the customer. In the ALERT payload only, never in logs. */
-  contactPhone: string;
-  reason: string;
-  /** Trimmed customer text for context. Payload only, never in logs. */
-  userText: string;
-};
-
-export type StaffNotifier = {
-  notify(alert: StaffAlert): Promise<void>;
-};
-
-/** Console implementation: the "send" is a log line with ids only (Slice 9 replaces this with Telegram). */
-export const consoleNotifier = (logger: Logger): StaffNotifier => ({
-  notify: async (alert) => {
-    logger.info(
-      {
-        clientId: alert.clientId,
-        contactId: alert.contactId,
-        reason: alert.reason,
-      },
-      "staff alert (console notifier)",
-    );
-  },
-});
+import type { StaffNotifier } from "../staff/alerts.js";
 
 export type PipelineDeps = {
   supabase: SupabaseClient;
@@ -162,6 +139,120 @@ export function promptLeak(system: string, parts: string[]): boolean {
     if (system.includes(joined.slice(i, i + 40))) return true;
   }
   return false;
+}
+
+/**
+ * Input classification for inbound text. Letters in ANY script (Devanagari,
+ * Bengali, Latin, ...) mean real language and pass, except latin-only strings
+ * with no vowels (keyboard mash). Emoji-only / digits-only / punctuation-only
+ * text has no letters at all and gets the clarify notice instead of the LLM.
+ */
+export type InputClass = "ok" | "empty" | "unclear";
+
+export function classifyInput(text: string): InputClass {
+  const trimmed = text.trim();
+  if (trimmed === "") return "empty";
+  if (!/[\p{L}]/u.test(trimmed)) return "unclear";
+  const letters = trimmed.replace(/[^A-Za-z]/g, "");
+  if (/^[A-Za-z\s\p{P}\d]+$/u.test(trimmed) && letters.length >= 6 && !/[aeiouAEIOU]/.test(letters)) {
+    return "unclear";
+  }
+  return "ok";
+}
+
+/**
+ * True when the two newest inbound texts are identical AND an outbound reply
+ * already went out after the first: re-answering the same question would spam
+ * the customer, so the job is done silently.
+ */
+export function isRepeatQuestion(
+  lastTwoInbound: [string, string] | null,
+  answeredSinceFirst: boolean,
+): boolean {
+  return lastTwoInbound !== null && lastTwoInbound[0] === lastTwoInbound[1] && answeredSinceFirst;
+}
+
+/** Phone-like digit runs (8-15 digits), digits only. */
+export function extractPhones(texts: string[]): string[] {
+  const found: string[] = [];
+  for (const text of texts) {
+    for (const match of text.matchAll(/\+?\d[\d\s\-.()]{6,13}\d/g)) {
+      const digits = match[0].replace(/[^\d]/g, "");
+      if (digits.length >= 8 && digits.length <= 15) found.push(digits);
+    }
+  }
+  return found;
+}
+
+/** Explicit clock times (10:30, 5 pm). Bare numbers are not times. */
+export function extractTimes(texts: string[]): string[] {
+  const found: string[] = [];
+  for (const text of texts) {
+    for (const match of text.matchAll(/\b\d{1,2}:\d{2}\b|\b\d{1,2}\s?(?:am|pm)\b/gi)) {
+      found.push(match[0].toLowerCase().replace(/\s+/g, ""));
+    }
+  }
+  return found;
+}
+
+/** URLs the model emitted. */
+export function extractUrls(texts: string[]): string[] {
+  const found: string[] = [];
+  for (const text of texts) {
+    for (const match of text.matchAll(/https?:\/\/[^\s)]+/gi)) {
+      found.push(match[0]);
+    }
+  }
+  return found;
+}
+
+/** True when the reply claims to be human ("I am human", "as a human", ...). */
+export function claimsHuman(parts: string[]): boolean {
+  const joined = parts.join("\n");
+  return /\b(i am|i'm|\bim)\s+(human|a person|a real person)\b|\bas a human\b/i.test(joined);
+}
+
+/**
+ * Consolidated output-safety verdict for a validated reply. Returns the
+ * violation code, or null when the reply may be sent. Pure: the caller logs.
+ * Codes: parts | price | phone | url | time | human_claim | prompt_leak.
+ */
+export function checkReplySafety(parts: string[], knowledgeText: string): string | null {
+  if (parts.length > 3 || parts.some((p) => p === "" || p.length > 300)) return "parts";
+  const plain = knowledgeText.replace(/,/g, "");
+  const plainDigits = plain.replace(/[^\d]/g, "");
+  const inventedPrice = extractAmounts(parts).filter((a) => !plain.includes(a.replace(/,/g, "")));
+  if (inventedPrice.length > 0) return "price";
+  const strangePhone = extractPhones(parts).filter((p) => !plainDigits.includes(p));
+  if (strangePhone.length > 0) return "phone";
+  const strangeUrl = extractUrls(parts).filter((u) => !knowledgeText.includes(u));
+  if (strangeUrl.length > 0) return "url";
+  const strangeTime = extractTimes(parts).filter((t) => !knowledgeText.toLowerCase().replace(/\s+/g, "").includes(t));
+  if (strangeTime.length > 0) return "time";
+  if (claimsHuman(parts)) return "human_claim";
+  return null;
+}
+
+/**
+ * Strips markdown the model was told not to use (**bold**, `code`, # headers,
+ * > quotes) and links the knowledge base never gave. Idempotent: clean text
+ * passes through unchanged. Returns parts with empties dropped; an empty
+ * result means "nothing safe to send".
+ */
+export function sanitizeReply(parts: string[], knowledgeText: string): string[] {
+  return parts
+    .map((part) => {
+      let out = part;
+      out = out.replace(/(\*\*|__)(.*?)\1/g, "$2");
+      out = out.replace(/(^|\s)[*_`~]+(\S)/gm, "$1$2");
+      out = out.replace(/(\S)[*_`~]+(\s|$)/gm, "$1$2");
+      out = out.replace(/^#{1,6}\s+/gm, "");
+      out = out.replace(/^>\s?/gm, "");
+      out = out.replace(/https?:\/\/[^\s)]+/gi, (url) => (knowledgeText.includes(url) ? url : ""));
+      out = out.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+      return out;
+    })
+    .filter((part) => part !== "");
 }
 
 function estCost(
@@ -302,7 +393,20 @@ async function generateValidated(
         throw new Error("reply is not valid JSON");
       }
     } catch (err) {
-      if (err instanceof LlmError) {
+      if (err instanceof CircuitOpenError) {
+        // Failing fast, not failing: log the blocked attempt like any other
+        // outcome so "why no LLM call" is answerable from the logs.
+        logger.info(
+          {
+            ...base,
+            latencyMs: Date.now() - started,
+            outcome: "circuit_open",
+            inputTokens: 0,
+            outputTokens: 0,
+          },
+          "llm call",
+        );
+      } else if (err instanceof LlmError) {
         // Transport exhausted (the adapter already backed off and retried):
         // log with its outcome and let the caller fall back.
         logger.info(
@@ -327,6 +431,10 @@ async function generateValidated(
     try {
       return await call(text, attempt);
     } catch (err) {
+      // CircuitOpenError is not an LlmError and always propagates: with the
+      // shared breaker the fallback model is cooling down too, so trying it
+      // would only add a blocked line for no benefit.
+      if (err instanceof CircuitOpenError) throw err;
       if (
         !(err instanceof LlmError) ||
         deps.fallbackLlm === undefined ||
@@ -348,6 +456,13 @@ async function generateValidated(
   try {
     return { reply: await callWithFallback(userText, 1), fallback: null };
   } catch (err) {
+    if (err instanceof CircuitOpenError) {
+      logger.warn(
+        { clientId, jobId },
+        "LLM circuit open: fallback reply",
+      );
+      return { reply: null, fallback: "llm_error" };
+    }
     if (err instanceof LlmError) {
       logger.warn(
         { clientId, jobId },
@@ -369,6 +484,13 @@ async function generateValidated(
       fallback: null,
     };
   } catch (err) {
+    if (err instanceof CircuitOpenError) {
+      logger.warn(
+        { clientId, jobId },
+        "LLM circuit open on retry: fallback reply",
+      );
+      return { reply: null, fallback: "llm_error" };
+    }
     if (err instanceof LlmError) {
       logger.warn(
         { clientId, jobId },
@@ -389,27 +511,14 @@ function postChecksOk(
   reply: Reply,
 ): boolean {
   const clientId = loaded.contact.client_id;
-  if (
-    reply.reply_parts.length > 3 ||
-    reply.reply_parts.some((p) => p === "" || p.length > 300)
-  ) {
-    deps.logger.warn(
-      { clientId },
-      "post-check failed: reply parts out of contract",
-    );
-    return false;
-  }
-  const knowledgeText = loaded.knowledge
-    .map((k) => `${k.title} ${k.content}`)
-    .join("\n");
-  const plain = knowledgeText.replace(/,/g, "");
-  const invented = extractAmounts(reply.reply_parts).filter(
-    (a) => !plain.includes(a.replace(/,/g, "")),
+  const violation = checkReplySafety(
+    reply.reply_parts,
+    loaded.knowledge.map((k) => `${k.title} ${k.content}`).join("\n"),
   );
-  if (invented.length > 0) {
+  if (violation !== null) {
     deps.logger.warn(
-      { clientId },
-      "post-check failed: reply invents a price not in knowledge",
+      { clientId, violation },
+      "post-check failed: reply violates output safety",
     );
     return false;
   }
@@ -474,18 +583,28 @@ export async function runReplyJob(
   };
 
   const messages = await listContactMessages(supabase, clientId, contact.id);
+  const unanswered = selectUnanswered(messages);
 
-  // 2. Older than 24h -> done, nothing. (last_inbound_at moves on every
-  // inbound, so a fresh job is never stale here; only a worker outage away.)
-  // Ahead of resume on purpose: a days-late retry must not send a stale
-  // reply; the unsent parts stay as an honestly abandoned record.
+  // 2. Older than 24h: Meta's free-text window is closed, so no free text may
+  // be sent. With messages still waiting, flag for a template or staff
+  // instead of going silent; with nothing waiting, just mark done.
   const lastInbound =
     contact.last_inbound_at === null ? 0 : Date.parse(contact.last_inbound_at);
   if (Number.isNaN(lastInbound) || Date.now() - lastInbound > DAY_MS) {
-    logger.info(
-      { clientId, contactId: contact.id, jobId: job.id },
-      "last inbound older than 24h: marking done",
-    );
+    if (unanswered.length > 0) {
+      await updateContact(supabase, clientId, contact.id, {
+        status: "needs_staff",
+      });
+      logger.warn(
+        { clientId, contactId: contact.id, jobId: job.id },
+        "outside 24h window: flagged for template or staff, nothing sent",
+      );
+    } else {
+      logger.info(
+        { clientId, contactId: contact.id, jobId: job.id },
+        "last inbound older than 24h: marking done",
+      );
+    }
     return { fallback: null };
   }
 
@@ -509,7 +628,6 @@ export async function runReplyJob(
   }
 
   // 4. Nothing unanswered -> done. This is what clears the old Slice 2 jobs.
-  const unanswered = selectUnanswered(messages);
   if (unanswered.length === 0) {
     logger.info(
       { clientId, contactId: contact.id, jobId: job.id },
@@ -544,16 +662,29 @@ export async function runReplyJob(
     return { fallback: null };
   }
 
-  // 6. Daily cap (UTC day): over it -> fallback + needs_staff, logged as error.
+  // 6. Daily caps (UTC day), read from settings with config fallback: over
+  // either cap -> fallback + needs_staff, logged as error, staff alerted
+  // once (client-level key: one open row until acknowledged).
+  const callCap = settings?.daily_llm_call_cap ?? config.dailyLlmCap;
+  const tokenCap = settings?.daily_llm_token_cap ?? null;
   const callsToday = await countLlmCallsSince(
     supabase,
     clientId,
     utcMidnightIso(),
   );
-  if (callsToday >= config.dailyLlmCap) {
+  const tokensToday =
+    tokenCap === null
+      ? 0
+      : await sumLlmUnitsSince(supabase, clientId, utcMidnightIso());
+  if (callsToday >= callCap || (tokenCap !== null && tokensToday >= tokenCap)) {
     logger.error(
-      { clientId, jobId: job.id, callsToday },
+      { clientId, jobId: job.id, callsToday, tokensToday },
       "daily LLM cap reached: fallback reply",
+    );
+    await deps.notifier.notify(
+      clientId,
+      "daily_cap",
+      `over cap (${callsToday} calls, ${tokensToday} tokens today)`,
     );
     return {
       fallback: await sendFallback(deps, sender, job, contact, "daily_cap"),
@@ -561,10 +692,13 @@ export async function runReplyJob(
   }
 
   // 7. Audio without transcripts (voice is Slice 5): notice once, or use text.
+  // Text-kind rows with empty bodies fall through to the input sanity check
+  // below instead of getting a voice notice they did not ask for.
+  const hasNonText = unanswered.some((m) => (m as Message).type !== "text");
   const inboundTexts = unanswered
     .map((m) => (m as Message).text ?? (m as Message).transcript ?? "")
     .filter((t) => t !== "");
-  if (inboundTexts.length === 0) {
+  if (inboundTexts.length === 0 && hasNonText) {
     logger.info(
       { clientId, contactId: contact.id, jobId: job.id },
       "audio without transcript: notice sent",
@@ -572,7 +706,70 @@ export async function runReplyJob(
     await sendParts(deps, sender, job, contact, [AUDIO_ONLY_TEXT]);
     return { fallback: null };
   }
-  const userText = trimUserText(inboundTexts.join("\n"));
+
+  // 8. Input sanity on the joined text: empty skips silently, emoji-only and
+  // gibberish get one clarify notice, an exact repeat of an already-answered
+  // question skips silently. Mixed scripts always proceed (real language).
+  const joinedText = inboundTexts.join("\n");
+  const inputClass = classifyInput(joinedText);
+  if (inputClass === "empty") {
+    logger.info(
+      { clientId, contactId: contact.id, jobId: job.id },
+      "empty inbound text: marking done",
+    );
+    return { fallback: null };
+  }
+  if (inputClass === "unclear") {
+    logger.info(
+      { clientId, contactId: contact.id, jobId: job.id },
+      "unclear inbound text: clarify notice sent",
+    );
+    await sendParts(deps, sender, job, contact, [CLARIFY_TEXT]);
+    return { fallback: null };
+  }
+  // Exact repeat of the immediately previous inbound question that already
+  // got an outbound reply: answering again would spam, so skip silently.
+  const trail = messages
+    .filter((m) => m.direction === "in")
+    .sort(
+      (a, b) => a.created_at.localeCompare(b.created_at) || a.seq - b.seq,
+    )
+    .filter((m) => (m.text ?? m.transcript ?? "") !== "");
+  const lastTwo: [string, string] | null =
+    trail.length >= 2
+      ? [
+          (trail[trail.length - 2] as Message).text ??
+            (trail[trail.length - 2] as Message).transcript ??
+            "",
+          (trail[trail.length - 1] as Message).text ??
+            (trail[trail.length - 1] as Message).transcript ??
+            "",
+        ]
+      : null;
+  const firstCreated: string | null =
+    trail.length >= 2
+      ? ((trail[trail.length - 2] as Message).created_at ?? null)
+      : null;
+  const answeredSinceFirst =
+    firstCreated !== null &&
+    messages.some(
+      (m) => m.direction === "out" && m.created_at >= firstCreated,
+    );
+  if (isRepeatQuestion(lastTwo, answeredSinceFirst)) {
+    logger.info(
+      { clientId, contactId: contact.id, jobId: job.id },
+      "repeated question already answered: marking done",
+    );
+    return { fallback: null };
+  }
+  const trimmed = trimUserTextWithNote(joinedText);
+  if (trimmed.truncated) {
+    logger.info(
+      { clientId, contactId: contact.id, jobId: job.id },
+      "user text exceeded the input limit: truncated with a note",
+    );
+  }
+  const userText = trimmed.text;
 
   // 8. LLM: history + prompt, validate, ONE retry with reminder, else fallback.
   const history = trimHistory(
@@ -609,6 +806,18 @@ export async function runReplyJob(
   }
   const reply = validated.reply;
 
+  // A human may have taken over while the LLM call was in flight: re-read
+  // the contact and abandon the send if so. The reply is discarded, not
+  // queued, because anything sent now would talk over the human.
+  const afterLlm = await loadContact(supabase, clientId, contact.id);
+  if (afterLlm === null || afterLlm.bot_paused) {
+    logger.info(
+      { clientId, contactId: contact.id, jobId: job.id },
+      "paused mid-pipeline: abandoning send",
+    );
+    return { fallback: null };
+  }
+
   // 9. Post-checks in code; any failure -> fallback, never the raw reply.
   if (!postChecksOk(deps, loaded, system, reply)) {
     return {
@@ -624,16 +833,9 @@ export async function runReplyJob(
       bot_paused: true,
       status: "needs_staff",
     });
-    await deps.notifier.notify({
-      clientId,
-      businessName: loaded.businessName,
+    await deps.notifier.notify(clientId, "handover", handoverReason, {
       contactId: contact.id,
-      contactPhone: contact.phone,
-      reason:
-        reply.intent === "human"
-          ? "intent=human"
-          : `confidence=${reply.confidence}`,
-      userText,
+      jobId: job.id,
     });
     logger.info(
       {
@@ -670,7 +872,20 @@ export async function runReplyJob(
   if (Object.keys(patch).length > 0)
     await updateContact(supabase, clientId, contact.id, patch);
 
-  await sendParts(deps, sender, job, contact, parts);
+  // Last thing before the wire: strip markdown and links the knowledge base
+  // never gave. The guards above validated the raw reply; this only removes
+  // formatting, so it cannot introduce a violation. Our own appended
+  // sentences (team confirm) are safe by construction and stay intact.
+  const knowledgeText = loaded.knowledge
+    .map((k) => `${k.title} ${k.content}`)
+    .join("\n");
+  const clean = sanitizeReply(parts, knowledgeText);
+  if (clean.length === 0) {
+    return {
+      fallback: await sendFallback(deps, sender, job, contact, "post_check"),
+    };
+  }
+  await sendParts(deps, sender, job, contact, clean);
   return { fallback: null };
 }
 
@@ -745,6 +960,21 @@ async function sendSavedParts(
       row = inserted.message;
     }
     if (row.wamid !== null) continue; // already sent (inserted by an earlier attempt)
+    // Re-read the contact before every send: a human may have taken over
+    // while the LLM call or an earlier part was in flight. Stopping here
+    // leaves the remaining parts unsent; the human owns the chat now.
+    const current = await loadContact(
+      deps.supabase,
+      job.client_id,
+      contact.id,
+    );
+    if (current === null || current.bot_paused) {
+      deps.logger.info(
+        { clientId: job.client_id, contactId: contact.id, jobId: job.id },
+        "paused mid-send: stopping after the sent parts",
+      );
+      return;
+    }
     // The row exists BEFORE the send: a crash here leaves a wamid-less part
     // that the next attempt resumes instead of duplicating.
     // Known limit, stated honestly: a send that throws AFTER Meta accepted it

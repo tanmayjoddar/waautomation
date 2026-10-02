@@ -8,10 +8,13 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { chatOnce, cleanupChatRows } from "../../scripts/chat.js";
+import { FALLBACK_TEXT } from "../../src/jobs/pipeline.js";
 import { loadEnv } from "../../src/config.js";
 import type { Message } from "../../src/db/types.js";
 import { createLogger } from "../../src/logger.js";
 import { createFakeLlm } from "../../src/ai/fake.js";
+import { WhatsAppApiError } from "../../src/whatsapp/client.js";
+import type { WhatsAppClient } from "../../src/whatsapp/client.js";
 import { baseEnv, collectingStream } from "../helpers.js";
 import {
   dbHarness,
@@ -90,6 +93,7 @@ describe.skipIf(!ready.ok)(suiteName, () => {
     text: string,
     out: { write(chunk: string): void },
     contactPhone: string = phone,
+    sender?: WhatsAppClient,
   ): Promise<{
     replies: string[];
     stored: number;
@@ -122,6 +126,7 @@ describe.skipIf(!ready.ok)(suiteName, () => {
         contactPhone,
         out,
         sendGapMs: 0,
+        sender,
       },
       text,
     ).then(({ summary, replies }) => ({
@@ -291,8 +296,60 @@ describe.skipIf(!ready.ok)(suiteName, () => {
         .select("id")
         .eq("client_id", clientId)
         .eq("phone", phone);
-      expect(contacts).toHaveLength(0);
-      expect(logs()).not.toContain(phone);
+    expect(contacts).toHaveLength(0);
+    expect(logs()).not.toContain(phone);
+    }),
+  );
+
+  it(
+    "a fallback reply prints with its reason tag",
+    test(async () => {
+      const chunks: string[] = [];
+      const { replies } = await chat(
+        ["not json", "still not json"],
+        "hello?",
+        { write: (c: string) => void chunks.push(c) },
+      );
+
+      expect(replies).toEqual([FALLBACK_TEXT]);
+      const printed = chunks.join("");
+      expect(printed).toContain(`[fallback: invalid_json_twice]`);
+      expect(printed).not.toContain(phone);
+    }),
+  );
+
+  it(
+    "a failing job prints an error line",
+    test(async () => {
+      const chunks: string[] = [];
+      const failing: WhatsAppClient = {
+        sendText: async () => {
+          throw new WhatsAppApiError("sendText: down", 503, null, 1, "Meta down");
+        },
+        markReadAndType: async () => undefined,
+      };
+      const { replies } = await chat(
+        [
+          JSON.stringify({
+            reply_parts: ["Hello!"],
+            language: "english",
+            intent: "question",
+            name: null,
+            service: null,
+            chosen_slot: null,
+            confidence: 0.9,
+          }),
+        ],
+        "failing turn?",
+        { write: (c: string) => void chunks.push(c) },
+        phone,
+        failing,
+      );
+
+      expect(replies).toHaveLength(0);
+      const printed = chunks.join("");
+      expect(printed).toContain("(job retried:");
+      expect(printed).not.toContain(phone);
     }),
   );
 });

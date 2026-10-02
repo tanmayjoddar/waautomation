@@ -47,7 +47,7 @@ export async function retry(
 
 async function probeSchema(
   supabase: SupabaseClient,
-  opts: { requireMessageErrorColumns?: boolean; requireWorkerQueue?: boolean } = {},
+  opts: { requireMessageErrorColumns?: boolean; requireWorkerQueue?: boolean; requireStaffAlerts?: boolean } = {},
 ): Promise<string | null> {
   const { error } = await supabase.from('clients').select('id').limit(1);
   if (!error) {
@@ -72,6 +72,14 @@ async function probeSchema(
         return `003_worker.sql has not been applied: run supabase/migrations/003_worker.sql in the Supabase SQL Editor first (Postgres said: ${startedError.message})`;
       }
     }
+    if (opts.requireStaffAlerts) {
+      // Migration 005: staff_alerts table. Probe it directly so suites skip
+      // loudly instead of failing on PostgREST errors.
+      const { error: alertsError } = await supabase.from('staff_alerts').select('id').limit(1);
+      if (alertsError) {
+        return `005_staff_alerts.sql has not been applied: run supabase/migrations/005_staff_alerts.sql in the Supabase SQL Editor first (Postgres said: ${alertsError.message})`;
+      }
+    }
     return null;
   }
   const message = error.message;
@@ -88,7 +96,7 @@ async function probeSchema(
  */
 export async function schemaReadiness(
   supabase: SupabaseClient,
-  opts?: { requireMessageErrorColumns?: boolean; requireWorkerQueue?: boolean },
+  opts?: { requireMessageErrorColumns?: boolean; requireWorkerQueue?: boolean; requireStaffAlerts?: boolean },
 ): Promise<string | null> {
   return probeSchema(supabase, opts ?? {});
 }

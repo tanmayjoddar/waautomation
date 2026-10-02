@@ -23,13 +23,13 @@ import {
 } from "../db/supabase.js";
 import type { Job } from "../db/types.js";
 import type { LlmAdapter } from "../ai/llm.js";
+import { CircuitBreaker, withCircuitBreaker } from "../ai/circuitBreaker.js";
 import { createFallbackLlmAdapter } from "../ai/index.js";
 import {
-  consoleNotifier,
-  runReplyJob,
-  type PipelineDeps,
+  createDbNotifier,
   type StaffNotifier,
-} from "./pipeline.js";
+} from "../staff/alerts.js";
+import { runReplyJob, type PipelineDeps } from "./pipeline.js";
 
 export type WorkerDeps = {
   supabase: SupabaseClient;
@@ -39,6 +39,9 @@ export type WorkerDeps = {
   notifier?: StaffNotifier;
   sendGapMs?: number;
   consoleOut?: { write(chunk: string): void };
+  /** Test seams: production always uses the defaults. */
+  stopTimeoutMs?: number;
+  requeueEveryMs?: number;
 };
 
 export type WorkerHandle = {
@@ -62,14 +65,19 @@ export function pipelineDepsFor(
     throw new Error(
       "worker needs LLM config (LLM_PROVIDER, LLM_API_KEY, LLM_MODEL)",
     );
+  // One breaker shared by primary and fallback: N consecutive failures of
+  // either trip a single cooldown for both. Per worker process (see
+  // circuitBreaker.ts for why restarts fail open).
+  const breaker = new CircuitBreaker();
+  const fallbackRaw = createFallbackLlmAdapter(llmConfig, deps.logger);
   return {
     supabase: deps.supabase,
     logger: deps.logger,
-    llm: deps.llm,
-    fallbackLlm: createFallbackLlmAdapter(llmConfig, deps.logger) ?? undefined,
+    llm: withCircuitBreaker(deps.llm, breaker),
+    fallbackLlm: fallbackRaw ? withCircuitBreaker(fallbackRaw, breaker) : undefined,
     llmConfig,
     config: deps.config,
-    notifier: deps.notifier ?? consoleNotifier(deps.logger),
+    notifier: deps.notifier ?? createDbNotifier(deps.supabase, deps.logger),
     sendGapMs: deps.sendGapMs,
     consoleOut: deps.consoleOut,
   };
@@ -105,6 +113,17 @@ export async function settleJob(
         { jobId: job.id, clientId: job.client_id, outcome },
         `reply job ${outcome}`,
       );
+      if (outcome === "failed") {
+        // Terminal: retries exhausted. One alert per failed job (the
+        // open-dedup key includes the job id); repeats are impossible
+        // because a failed job never runs again.
+        await pipeline.notifier.notify(
+          job.client_id,
+          "job_failed",
+          message.slice(0, 200),
+          { contactId: job.contact_id, jobId: job.id },
+        );
+      }
       return { outcome, error: message };
     } catch (dbErr) {
       logger.error(
@@ -119,6 +138,8 @@ export async function settleJob(
 export function startWorker(deps: WorkerDeps): WorkerHandle {
   const { supabase, logger, config } = deps;
   const pipeline = pipelineDepsFor(deps);
+  const stopTimeoutMs = deps.stopTimeoutMs ?? STOP_TIMEOUT_MS;
+  const requeueEveryMs = deps.requeueEveryMs ?? REQUEUE_EVERY_MS;
   let claiming = true;
   const inFlight = new Set<Promise<void>>();
   let lastRequeue = 0;
@@ -130,7 +151,7 @@ export function startWorker(deps: WorkerDeps): WorkerHandle {
   const loop = async (): Promise<void> => {
     while (claiming) {
       try {
-        if (Date.now() - lastRequeue >= REQUEUE_EVERY_MS) {
+        if (Date.now() - lastRequeue >= requeueEveryMs) {
           lastRequeue = Date.now();
           const moved = await requeueStaleJobs(supabase, STALE_MINUTES);
           if (moved > 0) logger.info({ moved }, "stale jobs requeued");
@@ -164,7 +185,7 @@ export function startWorker(deps: WorkerDeps): WorkerHandle {
       );
       await Promise.race([
         Promise.allSettled([...inFlight]),
-        sleep(STOP_TIMEOUT_MS).then(() => {
+        sleep(stopTimeoutMs).then(() => {
           logger.warn(
             { inFlight: inFlight.size },
             "worker stop timed out: leaving jobs running",

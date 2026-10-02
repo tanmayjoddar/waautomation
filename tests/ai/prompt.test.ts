@@ -11,6 +11,8 @@ import {
   PROMPT_LIMITS,
   trimHistory,
   trimUserText,
+  trimUserTextWithNote,
+  TRUNCATION_NOTE,
 } from '../../src/ai/prompt.js';
 
 const knowledge = (content: string, title = 'Haircut'): Knowledge => ({
@@ -81,6 +83,14 @@ describe('caps and trims', () => {
   it('trims user text to 1000 chars', () => {
     expect(trimUserText('x'.repeat(1001)).length).toBe(1000);
     expect(trimUserText('short')).toBe('short');
+  });
+
+  it('trims with an honest note and reports truncation', () => {
+    expect(trimUserTextWithNote('short')).toEqual({ text: 'short', truncated: false });
+    const long = trimUserTextWithNote('x'.repeat(1001));
+    expect(long.truncated).toBe(true);
+    expect(long.text).toContain(TRUNCATION_NOTE);
+    expect(long.text.length).toBeLessThanOrEqual(1000 + TRUNCATION_NOTE.length + 1);
   });
 
   it('keeps the last 10 history turns, each at most 500 chars', () => {

@@ -204,6 +204,30 @@ describe('retry policy (provider-independent, exercised on gemini)', () => {
     expect(calls).toHaveLength(2);
   });
 
+  it('aborts a hung provider at the timeout and reports it as timeout, not success', async () => {
+    let aborted = false;
+    const hanging = (async (_url: unknown, init?: RequestInit): Promise<Response> => {
+      await new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          aborted = true;
+          reject(new DOMException('aborted', 'AbortError'));
+        }, { once: true });
+      });
+      throw new Error('unreachable');
+    }) as typeof fetch;
+    const adapter = createGeminiAdapter({ apiKey: 'k', model: 'm', fetchImpl: hanging, baseDelayMs: 5 });
+
+    const started = Date.now();
+    const error = await adapter.generate(input({ timeoutMs: 50 })).catch((err: unknown) => err);
+    const elapsed = Date.now() - started;
+
+    expect(aborted).toBe(true);
+    expect(error).toBeInstanceOf(LlmError);
+    expect((error as LlmError).status).toBeNull();
+    // Three attempts at ~50ms plus two 5ms backoffs: bounded, never hanging.
+    expect(elapsed).toBeLessThan(5000);
+  }, 15000);
+
   it('throws on a 200 with no usable text', async () => {
     const { fetchImpl } = stubFetch([json({ candidates: [] })]);
     await expect(mk(fetchImpl).generate(input())).rejects.toThrow(/empty response/);

@@ -69,9 +69,6 @@ const envSchema = z.object({
     .optional(),
   STT_API_KEY: z.string().min(1).optional(),
 
-  TELEGRAM_BOT_TOKEN: z.string().min(1).optional(),
-  TELEGRAM_CHAT_ID: z.string().min(1).optional(),
-
   GOOGLE_SERVICE_ACCOUNT_EMAIL: z
     .string()
     .email("must be the service account email address")
@@ -170,11 +167,6 @@ const FEATURE_GROUPS = [
     label: "Google Sheets client copy",
     keys: ["GOOGLE_SERVICE_ACCOUNT_EMAIL", "GOOGLE_PRIVATE_KEY"],
   },
-  {
-    key: "telegram",
-    label: "Telegram staff alerts",
-    keys: ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"],
-  },
 ] as const satisfies ReadonlyArray<{
   key: string;
   label: string;
@@ -222,7 +214,6 @@ export type AppConfig = {
     provider: "openai-whisper" | "gemini" | "google" | "sarvam" | "fake";
     apiKey: string;
   } | null;
-  telegram: { botToken: string; chatId: string } | null;
   sheets: { serviceAccountEmail: string; privateKey: string } | null;
   timings: {
     sheetSyncIntervalSeconds: number;
@@ -383,7 +374,6 @@ export function loadEnv(source: RawEnv = process.env): AppConfig {
     llm: false,
     stt: false,
     sheets: false,
-    telegram: false,
   } as Features;
 
   for (const group of FEATURE_GROUPS) {
@@ -531,12 +521,6 @@ export function loadEnv(source: RawEnv = process.env): AppConfig {
             | "sarvam"
             | "fake",
           apiKey: e.STT_API_KEY as string,
-        }
-      : null,
-    telegram: features.telegram
-      ? {
-          botToken: e.TELEGRAM_BOT_TOKEN as string,
-          chatId: e.TELEGRAM_CHAT_ID as string,
         }
       : null,
     sheets: features.sheets

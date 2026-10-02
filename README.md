@@ -27,7 +27,7 @@ Fill in `.env`. Rules enforced by `src/config.ts`:
   `LLM_API_KEY` without `LLM_PROVIDER` and `LLM_MODEL` is a startup error, not a
   warning. Optional groups: WhatsApp (`META_APP_SECRET`, `META_VERIFY_TOKEN`,
   `GRAPH_API_VERSION`), demo mode (`WA_PHONE_NUMBER_ID`, `WA_TOKEN`), LLM, STT,
-  Google Sheets, Telegram.
+  Google Sheets.
 - `NODE_ENV=production` additionally requires `PUBLIC_BASE_URL` and
   `ENCRYPTION_KEY` (`openssl rand -base64 32`).
 - Missing or invalid variables are reported **all at once**, by name, with no
@@ -175,8 +175,18 @@ in this slice; per-client tokens live AES-GCM encrypted in `wa_token_enc`.
 ```bash
 npm run chat        # SEND_MODE=console required: fake customer, real worker, cleaned up on exit
 npm run resume -- <phone>   # bot_paused=false, status=new for a demo-client contact
-npm run eval        # ~25 canned conversations vs the real LLM (free-tier $0); prints pass/fail + transcripts
+npm run eval        # ~35 canned conversations vs the real LLM (free-tier $0); prints pass/fail + transcripts
+npm run alerts      # list open staff alerts (handover, failed jobs, caps)
+npm run alerts -- ack <id>  # acknowledge one (unique id prefix is enough)
+npm run summary -- --period day|week [--out file]  # per-client counts to console, optionally a file
 ```
+
+Staff alerts are the only alert channel (there is no Telegram integration):
+handover, failed jobs and daily caps write one row to `staff_alerts`
+(deduplicated per open alert until acknowledged) plus one error log line with
+ids only. Dashboard users read only their own tenant's rows via RLS; the
+`alerts` command uses the service role. Per-client LLM budgets live in
+`settings.daily_llm_call_cap` / `daily_llm_token_cap` (null = server defaults).
 
 Costs stay at $0 while testing: `npm test` and `npm run chat` use fake/mocked
 providers only. Eval uses your free-tier key (~60 calls vs ~1500/day quota).
@@ -203,7 +213,7 @@ phone numbers are redacted (`919812345678` -> `91********78`).
 | **1** | Migration SQL, Supabase client, seed script, RLS and function tests | **done** (88 tests green against a real project) |
 | **2** | Webhook GET/POST, signature verification, dedupe, `simulate-webhook.ts` | **done** (code done; the live suites need the updated migration re-run) |
 | 3 | WhatsApp client adapter (`sendText`, `markReadAndType`), console send mode | **done** |
-| 4 | Worker + debounce + LLM adapter + prompt + zod schema, eval script | **done** |
+| 4 | Worker + debounce + LLM adapter + prompt + zod schema, eval script | **done** (332 tests, 20 consecutive green runs) |
 | 5 | Voice notes: media download + STT adapter | not started |
 | 6 | Human-like pacing | not started |
 | 7 | Slots + bookings + confirmation | not started |

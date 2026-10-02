@@ -18,6 +18,14 @@ import { createLogger } from "../../src/logger.js";
 import { createFakeLlm } from "../../src/ai/fake.js";
 import { LlmError } from "../../src/ai/llm.js";
 import {
+  CircuitBreaker,
+  withCircuitBreaker,
+} from "../../src/ai/circuitBreaker.js";
+import { WhatsAppApiError } from "../../src/whatsapp/client.js";
+import { settleJob } from "../../src/jobs/worker.js";
+import { ingestWebhookPayload } from "../../src/webhook/ingest.js";
+import { createClient } from "@supabase/supabase-js";
+import {
   AUDIO_ONLY_TEXT,
   FALLBACK_REPEAT_TEXT,
   FALLBACK_TEXT,
@@ -26,8 +34,8 @@ import {
   TEAM_CONFIRM_TEXT,
   runReplyJob,
   type PipelineDeps,
-  type StaffAlert,
 } from "../../src/jobs/pipeline.js";
+import { createDbNotifier, type AlertRefs } from "../../src/staff/alerts.js";
 import {
   createFakeWhatsAppClient,
   type FakeWhatsAppClient,
@@ -94,10 +102,10 @@ describe.skipIf(!ready.ok)(suiteName, () => {
     overrides: Partial<PipelineDeps> = {},
   ): {
     deps: PipelineDeps;
-    alerts: StaffAlert[];
+    alerts: Array<{ clientId: string; kind: string; reason: string; refs?: AlertRefs }>;
     sender: FakeWhatsAppClient;
   } => {
-    const alerts: StaffAlert[] = [];
+    const alerts: Array<{ clientId: string; kind: string; reason: string; refs?: AlertRefs }> = [];
     const sender = createFakeWhatsAppClient();
     const deps: PipelineDeps = {
       supabase: h.supabase,
@@ -112,7 +120,12 @@ describe.skipIf(!ready.ok)(suiteName, () => {
         maxOutputTokens: 400,
       },
       config: testConfig(),
-      notifier: { notify: async (a: StaffAlert) => void alerts.push(a) },
+      notifier: {
+        notify: async (clientId: string, kind: string, reason: string, refs?: AlertRefs) => {
+          alerts.push({ clientId, kind, reason, refs });
+          return { created: true };
+        },
+      },
       sendGapMs: 0,
       sender,
       consoleOut: { write: () => undefined },
@@ -201,6 +214,7 @@ describe.skipIf(!ready.ok)(suiteName, () => {
     h = ready.harness;
     skipReason = await schemaReadiness(h.supabase, {
       requireWorkerQueue: true,
+      requireStaffAlerts: true,
     });
     if (skipReason !== null) return;
     phoneNumberId = `${h.tag}-pipe`;
@@ -259,6 +273,19 @@ describe.skipIf(!ready.ok)(suiteName, () => {
         .single();
       expect((updated as Contact).language).toBe("english");
       expect((updated as Contact).status).toBe("new");
+      // One info line for the attempt, with fields and no customer content.
+      const calls = logRecords().filter((r) => r["msg"] === "llm call");
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toMatchObject({
+        level: "info",
+        jobId: job.id,
+        provider: "fake",
+        model: "fake",
+        attempt: 1,
+        outcome: "ok",
+      });
+      expect(typeof calls[0]?.["latencyMs"]).toBe("number");
+      expect(calls[0]?.["inputTokens"]).toBeGreaterThan(0);
     }),
   );
 
@@ -365,8 +392,10 @@ describe.skipIf(!ready.ok)(suiteName, () => {
   it(
     "invalid JSON retries once with a reminder, then falls back",
     test(async () => {
-      const contact = await newContact();
-      await addInbound(contact, "hello?");
+      const contact = await newContact(90);
+      const canaryPhone = testPhone(h.tag, 90);
+      const canaryText = "PII_JSON_CANARY_5519";
+      await addInbound(contact, canaryText);
       const fake = createFakeLlm([
         { text: "not json at all" },
         { text: "still not json" },
@@ -387,6 +416,15 @@ describe.skipIf(!ready.ok)(suiteName, () => {
         .eq("id", contact.id)
         .single();
       expect((updated as Contact).status).toBe("needs_staff");
+      // Even on the failure path: no phone, no customer text, no key in logs.
+      const out = logs();
+      expect(out).not.toContain(canaryPhone);
+      expect(out).not.toContain(canaryText);
+      expect(out).not.toContain("test-llm-key-CANARY-9");
+      const fallback = logRecords().find(
+        (r) => r["msg"] === "pipeline fallback" && r["jobId"] === job.id,
+      );
+      expect(fallback).toMatchObject({ level: "info", reason: "invalid_json_twice" });
     }),
   );
 
@@ -407,6 +445,15 @@ describe.skipIf(!ready.ok)(suiteName, () => {
       const rows = await outRows(contact.id);
       expect(rows).toHaveLength(1);
       expect(rows[0]?.text).toBe(FALLBACK_TEXT);
+      const attempts = logRecords().filter(
+        (r) => r["msg"] === "llm call" && r["jobId"] === job.id,
+      );
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]).toMatchObject({ attempt: 1, outcome: "http_status 429" });
+      const fallback = logRecords().find(
+        (r) => r["msg"] === "pipeline fallback" && r["jobId"] === job.id,
+      );
+      expect(fallback).toMatchObject({ level: "info", reason: "llm_error" });
     }),
   );
 
@@ -480,6 +527,10 @@ describe.skipIf(!ready.ok)(suiteName, () => {
         .single();
       expect((updated as Contact).status).toBe("needs_staff");
       expect(logs()).toContain("daily LLM cap");
+      const fallback = logRecords().find(
+        (r) => r["msg"] === "pipeline fallback" && r["jobId"] === job.id,
+      );
+      expect(fallback).toMatchObject({ level: "info", reason: "daily_cap" });
     }),
   );
 
@@ -502,6 +553,10 @@ describe.skipIf(!ready.ok)(suiteName, () => {
       expect((await outRows(contact.id)).map((r) => r.text)).toEqual([
         FALLBACK_TEXT,
       ]);
+      const fallback = logRecords().find(
+        (r) => r["msg"] === "pipeline fallback" && r["jobId"] === job.id,
+      );
+      expect(fallback).toMatchObject({ reason: "post_check" });
     }),
   );
 
@@ -572,7 +627,11 @@ describe.skipIf(!ready.ok)(suiteName, () => {
         status: "needs_staff",
       });
       expect(alerts).toHaveLength(1);
-      expect(alerts[0]).toMatchObject({ clientId, reason: "intent=human" });
+      expect(alerts[0]).toMatchObject({ clientId, kind: "handover", reason: "human_intent" });
+      const handed = logRecords().find(
+        (r) => r["msg"] === "handed over to staff" && r["jobId"] === job.id,
+      );
+      expect(handed).toMatchObject({ level: "info", reason: "human_intent" });
       expect((await outRows(contact.id)).map((r) => r.text)).toEqual([
         HANDOVER_TEXT,
       ]);
@@ -598,7 +657,11 @@ describe.skipIf(!ready.ok)(suiteName, () => {
       await runReplyJob(deps, job);
 
       expect(alerts).toHaveLength(1);
-      expect(alerts[0]?.reason).toContain("confidence=0.2");
+      expect(alerts[0]).toMatchObject({ clientId, kind: "handover", reason: "low_confidence" });
+      const handed = logRecords().find(
+        (r) => r["msg"] === "handed over to staff" && r["jobId"] === job.id,
+      );
+      expect(handed).toMatchObject({ level: "info", reason: "low_confidence" });
       const { data: updated } = await h.supabase
         .from("contacts")
         .select("bot_paused")
@@ -789,6 +852,9 @@ describe.skipIf(!ready.ok)(suiteName, () => {
     test(async () => {
       const contact = await newContact();
       await addInbound(contact, "timings please");
+      await addKnowledge([
+        { kind: "timing", title: "Hours", content: "We open at 10 am." },
+      ]);
       const fake = createFakeLlm([
         { text: '{"reply_parts":["We open at 10' },
         { text: replyJson(["We open at 10 am."]) },
@@ -823,6 +889,341 @@ describe.skipIf(!ready.ok)(suiteName, () => {
 
       const texts = (await outRows(contact.id)).map((r) => r.text).sort();
       expect(texts).toEqual([FALLBACK_REPEAT_TEXT, FALLBACK_TEXT].sort());
+    }),
+  );
+
+  it(
+    "open circuit: no LLM call, fallback sent, blocked attempt logged",
+    test(async () => {
+      const contact = await newContact();
+      await addInbound(contact, "hello?");
+      const fake = createFakeLlm([
+        { text: replyJson(["Should never be used."]) },
+      ]);
+      const breaker = new CircuitBreaker(1, 60_000);
+      breaker.recordFailure();
+      expect(breaker.opened).toBe(true);
+      const guarded = withCircuitBreaker(fake, breaker);
+      const { deps } = depsFor(createFakeLlm([]));
+      const guardedDeps = { ...deps, llm: guarded };
+      const job = await claimJob(contact);
+
+      await runReplyJob(guardedDeps, job);
+
+      expect(fake.calls).toHaveLength(0);
+      expect((await outRows(contact.id)).map((r) => r.text)).toEqual([
+        FALLBACK_TEXT,
+      ]);
+      const blocked = logRecords().filter(
+        (r) => r["msg"] === "llm call" && r["outcome"] === "circuit_open",
+      );
+      expect(blocked.length).toBeGreaterThan(0);
+      expect(blocked[0]).toMatchObject({ jobId: job.id, level: "info" });
+      const fallback = logRecords().find(
+        (r) => r["msg"] === "pipeline fallback" && r["jobId"] === job.id,
+      );
+      expect(fallback).toMatchObject({ reason: "llm_error" });
+    }),
+  );
+
+  it(
+    "human takeover mid-pipeline cancels the send",
+    test(async () => {
+      const contact = await newContact();
+      await addInbound(contact, "hello?");
+      const pausing = {
+        provider: "pausing",
+        generate: async () => {
+          await h.supabase
+            .from("contacts")
+            .update({ bot_paused: true })
+            .eq("id", contact.id);
+          return { text: replyJson(["Hello there."]), inputTokens: 1, outputTokens: 1 };
+        },
+      };
+      const { deps } = depsFor(createFakeLlm([]));
+      const pausingDeps = { ...deps, llm: pausing as never };
+      const job = await claimJob(contact);
+
+      await runReplyJob(pausingDeps, job);
+
+      expect(await outRows(contact.id)).toHaveLength(0);
+      expect(logs()).toContain("paused mid-pipeline");
+    }),
+  );
+
+  it(
+    "outside the 24h window with messages waiting: flagged, nothing sent",
+    test(async () => {
+      const old = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+      const contact = await newContact(undefined, { last_inbound_at: old });
+      await h.supabase.from("messages").insert({
+        client_id: clientId,
+        contact_id: contact.id,
+        wamid: `wamid.PIPE.STALE.${h.tag}`,
+        direction: "in",
+        type: "text",
+        text: "old question",
+        created_at: old,
+      });
+      const fake = createFakeLlm([]);
+      const { deps } = depsFor(fake);
+      const job = await claimJob(contact);
+
+      await runReplyJob(deps, job);
+
+      expect(fake.calls).toHaveLength(0);
+      expect(await outRows(contact.id)).toHaveLength(0);
+      const { data: updated } = await h.supabase
+        .from("contacts")
+        .select("status")
+        .eq("id", contact.id)
+        .single();
+      expect((updated as Contact).status).toBe("needs_staff");
+      expect(logs()).toContain("outside 24h window");
+    }),
+  );
+
+  it(
+    "exact repeat of an answered question sends nothing",
+    test(async () => {
+      const contact = await newContact();
+      const base = Date.now() - 60_000;
+      const iso = (offsetMs: number) => new Date(base + offsetMs).toISOString();
+      const rows = [
+        { wamid: `wamid.PIPE.REP.1.${h.tag}`, direction: "in", type: "text", text: "same question", created_at: iso(0) },
+        { wamid: `wamid.PIPE.REP.OUT.${h.tag}`, direction: "out", type: "text", text: "same answer", created_at: iso(1000) },
+        { wamid: `wamid.PIPE.REP.2.${h.tag}`, direction: "in", type: "text", text: "same question", created_at: iso(2000) },
+      ];
+      for (const row of rows) {
+        const { error } = await h.supabase.from("messages").insert({
+          client_id: clientId,
+          contact_id: contact.id,
+          ...row,
+        });
+        expect(error, "cannot seed repeat rows").toBeNull();
+      }
+      const fake = createFakeLlm([]);
+      const { deps } = depsFor(fake);
+      const job = await claimJob(contact);
+
+      await runReplyJob(deps, job);
+
+      expect(fake.calls).toHaveLength(0);
+      expect((await outRows(contact.id)).filter((r) => r.direction === "out")).toHaveLength(1);
+      expect(logs()).toContain("repeated question already answered");
+    }),
+  );
+
+  it(
+    "markdown and unlisted links are stripped before sending",
+    test(async () => {
+      const contact = await newContact();
+      await addInbound(contact, "What do you have?");
+      await addKnowledge([{ kind: "faq", title: "Menu", content: "See all at our shop." }]);
+      const fake = createFakeLlm([{ text: replyJson(["See **bold deal** today"]) }]);
+      const { deps } = depsFor(fake);
+      const job = await claimJob(contact);
+
+      await runReplyJob(deps, job);
+
+      expect((await outRows(contact.id)).map((r) => r.text)).toEqual(["See bold deal today"]);
+    }),
+  );
+
+  it(
+    "settings caps override config: calls and tokens",
+    test(async () => {
+      const contact = await newContact();
+      await addInbound(contact, "hello?");
+      await h.supabase.from("settings").insert({ client_id: clientId, daily_llm_call_cap: 0 });
+      const fake = createFakeLlm([{ text: replyJson(["Hi."]) }]);
+      const { deps } = depsFor(fake);
+      try {
+        const job = await claimJob(contact);
+        await runReplyJob(deps, job);
+        expect(fake.calls).toHaveLength(0);
+        expect((await outRows(contact.id)).map((r) => r.text)).toEqual([FALLBACK_TEXT]);
+      } finally {
+        await h.supabase.from("settings").delete().eq("client_id", clientId);
+      }
+    }),
+  );
+
+  it(
+    "settings token cap triggers the fallback",
+    test(async () => {
+      const contact = await newContact();
+      await addInbound(contact, "hello?");
+      await h.supabase.from("settings").insert({ client_id: clientId, daily_llm_call_cap: 9999, daily_llm_token_cap: 1 });
+      await h.supabase.from("usage_log").insert({ client_id: clientId, kind: "llm", units: 100, est_cost: null });
+      const fake = createFakeLlm([{ text: replyJson(["Hi."]) }]);
+      const { deps } = depsFor(fake);
+      try {
+        const job = await claimJob(contact);
+        await runReplyJob(deps, job);
+        expect(fake.calls).toHaveLength(0);
+        expect((await outRows(contact.id)).map((r) => r.text)).toEqual([FALLBACK_TEXT]);
+      } finally {
+        await h.supabase.from("settings").delete().eq("client_id", clientId);
+      }
+    }),
+  );
+
+  it(
+    "terminal job failure writes exactly one staff alert",
+    test(async () => {
+      const contact = await newContact();
+      await addInbound(contact, "hello?");
+      const failing = {
+        provider: "failing",
+        generate: async () => ({ text: replyJson(["Hi."]), inputTokens: 1, outputTokens: 1 }),
+      };
+      const throwing: WhatsAppClient = {
+        sendText: async () => {
+          throw new WhatsAppApiError("sendText: down", 503, null, 1, "Meta down");
+        },
+        markReadAndType: async () => undefined,
+      };
+      const { deps } = depsFor(createFakeLlm([]));
+      const logger = createLogger({ level: "debug", destination: stream });
+      const failingDeps = {
+        ...deps,
+        llm: failing as never,
+        sender: throwing,
+        notifier: createDbNotifier(h.supabase, logger),
+      };
+      const job = await claimJob(contact);
+      await h.supabase.from("jobs").update({ attempts: 3 }).eq("id", job.id);
+
+      const { settleJob: settle } = await import("../../src/jobs/worker.js");
+      const outcome = await settle(h.supabase, logger, { ...failingDeps }, { ...job, attempts: 3 });
+
+      expect(outcome.outcome).toBe("failed");
+      const { data, error } = await h.supabase
+        .from("staff_alerts")
+        .select("*")
+        .eq("client_id", clientId)
+        .eq("kind", "job_failed")
+        .eq("job_id", job.id);
+      expect(error).toBeNull();
+      expect(data).toHaveLength(1);
+    }),
+  );
+
+  it(
+    "a database error mid-pipeline propagates for the worker to retry",
+    test(async () => {
+      const contact = await newContact();
+      await addInbound(contact, "hello?");
+      const broken = createClient("https://invalid.invalid", "invalid-key", {
+        auth: { persistSession: false },
+      });
+      const fake = createFakeLlm([{ text: replyJson(["Hi."]) }]);
+      const { deps } = depsFor(fake);
+      const job = await claimJob(contact);
+
+      await expect(runReplyJob({ ...deps, supabase: broken }, job)).rejects.toThrow();
+      expect(fake.calls).toHaveLength(0);
+      const { data } = await h.supabase.from("jobs").select("status").eq("id", job.id).single();
+      expect((data as { status: string }).status).toBe("running");
+    }),
+  );
+
+  it(
+    "Meta 4xx on send retries with backoff instead of failing",
+    test(async () => {
+      const contact = await newContact();
+      await addInbound(contact, "hello?");
+      const bad: WhatsAppClient = {
+        sendText: async () => {
+          throw new WhatsAppApiError("sendText: bad request", 400, 131000, 1, "bad request");
+        },
+        markReadAndType: async () => undefined,
+      };
+      const fake = createFakeLlm([{ text: replyJson(["Hello!"]) }]);
+      const { deps } = depsFor(fake, { sender: bad });
+      const job = await claimJob(contact);
+      const logger = createLogger({ level: "debug", destination: stream });
+      const { settleJob: settle } = await import("../../src/jobs/worker.js");
+
+      const outcome = await settle(h.supabase, logger, deps, job);
+
+      expect(outcome.outcome).toBe("retried");
+      const { data } = await h.supabase.from("jobs").select("status,run_at,last_error").eq("id", job.id).single();
+      const row = data as { status: string; run_at: string; last_error: string };
+      expect(row.status).toBe("pending");
+      expect(Date.parse(row.run_at)).toBeGreaterThan(Date.now());
+      expect(row.last_error).not.toBeNull();
+    }),
+  );
+
+  it(
+    "duplicate webhook while a job runs stores nothing new",
+    test(async () => {
+      const phone = testPhone(h.tag, 81);
+      const wamid = `wamid.PIPE.DUP.${h.tag}`;
+      const delivery = {
+        object: "whatsapp_business_account",
+        entry: [
+          {
+            id: "WABA-TEST",
+            changes: [
+              {
+                field: "messages",
+                value: {
+                  messaging_product: "whatsapp",
+                  metadata: { display_phone_number: "15550000000", phone_number_id: phoneNumberId },
+                  contacts: [{ profile: { name: "Pipe" }, wa_id: phone }],
+                  messages: [
+                    { from: phone, id: wamid, timestamp: String(Math.floor(Date.now() / 1000)), type: "text", text: { body: "dup question" } },
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+      };
+      const ingest = {
+        supabase: h.supabase,
+        logger: createLogger({ level: "debug", destination: stream }),
+        debounceSeconds: 90,
+      };
+      const first = await ingestWebhookPayload(ingest, delivery);
+      expect(first.stored).toBe(1);
+      const { data: contact } = await h.supabase.from("contacts").select("id").eq("client_id", clientId).eq("phone", phone).single();
+      const contactId = (contact as { id: string }).id;
+      await enqueueReplyJob(h.supabase, clientId, contactId, 0);
+      const claimed = await claimDueJob(h.supabase, clientId);
+      expect(claimed).not.toBeNull();
+
+      const second = await ingestWebhookPayload(ingest, delivery);
+
+      expect(second.duplicates).toBe(1);
+      expect(second.stored).toBe(0);
+      const { count } = await h.supabase.from("jobs").select("id", { count: "exact", head: true }).eq("contact_id", contactId);
+      expect(count).toBe(1);
+    }),
+  );
+
+  it(
+    "two workers answer two contacts independently",
+    test(async () => {
+      const contactA = await newContact(82);
+      const contactB = await newContact(83);
+      await addInbound(contactA, "question A here");
+      await addInbound(contactB, "question B here");
+      const fakeA = createFakeLlm([{ text: replyJson(["Answer A."]) }]);
+      const fakeB = createFakeLlm([{ text: replyJson(["Answer B."]) }]);
+      const { deps: depsA } = depsFor(fakeA);
+      const { deps: depsB } = depsFor(fakeB);
+      const jobA = await claimJob(contactA);
+      const jobB = await claimJob(contactB);
+
+      await Promise.all([runReplyJob(depsA, jobA), runReplyJob(depsB, jobB)]);
+
+      expect((await outRows(contactA.id)).map((r) => r.text)).toEqual(["Answer A."]);
+      expect((await outRows(contactB.id)).map((r) => r.text)).toEqual(["Answer B."]);
     }),
   );
 });

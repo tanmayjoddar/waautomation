@@ -26,7 +26,8 @@ import type { Logger } from "pino";
 import { loadEnvFromFile, type AppConfig } from "../src/config.js";
 import { claimDueJob, createServiceClient } from "../src/db/supabase.js";
 import { createLogger } from "../src/logger.js";
-import { consoleNotifier, type PipelineDeps } from "../src/jobs/pipeline.js";
+import { type PipelineDeps } from "../src/jobs/pipeline.js";
+import { createDbNotifier } from "../src/staff/alerts.js";
 import { settleJob } from "../src/jobs/worker.js";
 import { createLlmAdapter, createFallbackLlmAdapter } from "../src/ai/index.js";
 import type { LlmAdapter } from "../src/ai/llm.js";
@@ -134,7 +135,7 @@ export async function chatOnce(
       createFallbackLlmAdapter(deps.llmConfig, deps.logger) ?? undefined,
     llmConfig: deps.llmConfig,
     config: deps.config,
-    notifier: consoleNotifier(deps.logger),
+    notifier: createDbNotifier(deps.supabase, deps.logger),
     sendGapMs: deps.sendGapMs ?? 0,
     sender: deps.sender,
     // Swallowed on purpose: the factory would print every reply itself, and
@@ -148,11 +149,11 @@ export async function chatOnce(
     const settled = await settleJob(deps.supabase, deps.logger, pipeline, job);
     const { data } = await deps.supabase
       .from("messages")
-      .select("text")
+      .select("text, wamid")
       .eq("job_id", job.id)
       .order("part_index");
-    for (const row of (data ?? []) as Array<{ text: string | null }>) {
-      if (row.text !== null && !replies.includes(row.text)) {
+    for (const row of (data ?? []) as Array<{ text: string | null; wamid: string | null }>) {
+      if (row.wamid !== null && row.text !== null && !replies.includes(row.text)) {
         replies.push(row.text);
         // The fallback tag travels with the reply line, so a fallback is
         // visible right where the eye already is — not just in the logs.

@@ -63,7 +63,6 @@ describe('loadEnv - feature groups', () => {
       llm: false,
       stt: false,
       sheets: false,
-      telegram: false,
     });
   });
 
@@ -76,7 +75,7 @@ describe('loadEnv - feature groups', () => {
       }),
     );
     expect(config.features.llm).toBe(true);
-    expect(config.llm).toEqual({ provider: 'fake', apiKey: 'not-used', model: 'canned', timeoutMs: 20000, maxOutputTokens: 400 });
+    expect(config.llm).toEqual({ provider: 'fake', apiKey: 'not-used', model: 'canned', timeoutMs: 20000, maxOutputTokens: 400, fallbackModel: null });
     expect(config.stt).toBeNull();
   });
 
@@ -469,8 +468,6 @@ describe('.env.example stays in sync with config.ts', () => {
       'LLM_MODEL',
       'STT_PROVIDER',
       'STT_API_KEY',
-      'TELEGRAM_BOT_TOKEN',
-      'TELEGRAM_CHAT_ID',
       'GOOGLE_SERVICE_ACCOUNT_EMAIL',
       'GOOGLE_PRIVATE_KEY',
       'PUBLIC_BASE_URL',

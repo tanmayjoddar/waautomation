@@ -39,6 +39,9 @@ export type Settings = {
   sheet_id: string | null;
   sheet_bookings_tab: string;
   sheet_leads_tab: string;
+  /** Per-client Slice 4 LLM budgets (migration 005). Null = server config defaults. */
+  daily_llm_call_cap: number | null;
+  daily_llm_token_cap: number | null;
 };
 
 export type KnowledgeKind = 'price' | 'faq' | 'timing' | 'address' | 'policy' | 'service';
@@ -149,6 +152,18 @@ export type SheetOutbox = {
   run_after: string;
   last_error: string | null;
   created_at: string;
+};
+
+/** Row shape for staff_alerts (migration 005): the only staff-alert channel. */
+export type StaffAlertRow = {
+  id: string;
+  client_id: string;
+  kind: string;
+  reason: string;
+  contact_id: string | null;
+  job_id: string | null;
+  created_at: string;
+  acknowledged_at: string | null;
 };
 
 /** Row shape returned by client_stats(client, from, to). */

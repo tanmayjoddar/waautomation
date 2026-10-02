@@ -468,6 +468,22 @@ export async function countLlmCallsSince(
   return count ?? 0;
 }
 
+/** LLM token units for a client since an ISO instant (daily token cap). */
+export async function sumLlmUnitsSince(
+  supabase: SupabaseClient,
+  clientId: string,
+  sinceIso: string,
+): Promise<number> {
+  const { data, error } = await supabase
+    .from('usage_log')
+    .select('units')
+    .eq('client_id', clientId)
+    .eq('kind', 'llm')
+    .gte('created_at', sinceIso);
+  if (error) throw new Error(`sumLlmUnitsSince failed: ${error.message}`);
+  return (data ?? []).reduce((sum, row) => sum + Number((row as { units: unknown }).units ?? 0), 0);
+}
+
 /** True when this contact recently got exactly this outbound text (notice/fallback dedupe). */
 export async function recentOutboundWithText(
   supabase: SupabaseClient,

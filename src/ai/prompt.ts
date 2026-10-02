@@ -43,6 +43,21 @@ export const trimUserText = (text: string): string =>
     ? text
     : text.slice(0, MAX_USER_TEXT_CHARS);
 
+/**
+ * Hard input limit with an honest note: the model is told the message was
+ * cut, so it never mistakes a fragment for the whole question. Returns
+ * whether truncation happened so the caller can log it (without the text).
+ */
+export const TRUNCATION_NOTE = "\n[truncated: message was longer]";
+
+export function trimUserTextWithNote(text: string): {
+  text: string;
+  truncated: boolean;
+} {
+  if (text.length <= MAX_USER_TEXT_CHARS) return { text, truncated: false };
+  return { text: text.slice(0, MAX_USER_TEXT_CHARS) + TRUNCATION_NOTE, truncated: true };
+}
+
 export function trimHistory(history: HistoryTurn[]): HistoryTurn[] {
   return history.slice(-MAX_HISTORY_TURNS).map((turn) => ({
     role: turn.role,
